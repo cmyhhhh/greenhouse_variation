@@ -48,6 +48,9 @@ class Greenhouse():
         self.cache_path = args.cache_path
         self.name = ""
         self.target_cache_path = ""
+        # 初始化token统计变量
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
         self.sha256hash = ""
 
         # flags
@@ -920,6 +923,17 @@ class Greenhouse():
         totaltime = time.time() - starttime
         print("[GREENHOUSE] TIME TAKEN = ", (totaltime / 60), "mins")
         print("[GREENHOUSE] REHOST STATUS - %s: %s" % (self.sha256hash, rehost_result))
+        
+        # 累计token统计
+        if hasattr(self, 'runner') and self.runner:
+            token_stats = self.runner.get_token_stats()
+            self.total_input_tokens += token_stats['input_tokens']
+            self.total_output_tokens += token_stats['output_tokens']
+            print("[TOKEN STATISTICS] Total Usage Across All Rounds:")
+            print(f"    - Total Input Tokens: {self.total_input_tokens}")
+            print(f"    - Total Output Tokens: {self.total_output_tokens}")
+            print(f"    - Total Tokens: {self.total_input_tokens + self.total_output_tokens}")
+        
         print("="*50)
         if success and wellformed:
             return 0
