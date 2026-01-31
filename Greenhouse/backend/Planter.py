@@ -861,8 +861,8 @@ class Planter():
         return sourcefile
 
     def transplant(self, fs_path, targets, folders, configs, failed, already_success, no_skip, hackdevproc, changelog):
-        print("    - processing nvram configs")
-        self.fixer.write_nvram(configs, changelog)
+        # print("    - processing nvram configs")
+        # self.fixer.write_nvram(configs, changelog)
 
         if already_success:
             print("    - already successful, focusing on get working nvrams up")

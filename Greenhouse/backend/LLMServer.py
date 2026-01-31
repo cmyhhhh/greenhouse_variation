@@ -259,15 +259,21 @@ class ReverseClient:
 
             if os.path.exists(i64_file):
                 ida_cmd = f"/ida/idat64 -A -L{reverse_dir}/decompileC.log -S{ida_script_path} {i64_file} 2>/dev/null"
-                subprocess.run(ida_cmd, shell=True)
+                result = subprocess.run(ida_cmd, shell=True, capture_output=True, text=True)
+                print(f"[ReverseClient] IDA cmd executed: {ida_cmd}")
+                print(f"[ReverseClient] IDA stdout: {result.stdout}")
+                print(f"[ReverseClient] IDA stderr: {result.stderr}")
             else:
                 ida_cmd = f"/ida/idat64 -A -L{reverse_dir}/decompileC.log -S{ida_script_path} -o{i64_file} {binary_path} 2>/dev/null"
-                subprocess.run(ida_cmd, shell=True)
+                result = subprocess.run(ida_cmd, shell=True, capture_output=True, text=True)
+                print(f"[ReverseClient] IDA cmd executed: {ida_cmd}")
+                print(f"[ReverseClient] IDA stdout: {result.stdout}")
+                print(f"[ReverseClient] IDA stderr: {result.stderr}")
 
             decompile_functions_name_path = os.path.join(
                 reverse_dir, "functions_name.txt")
             if not os.path.exists(decompile_functions_name_path):
-                raise Exception(f"{filename} 反编译失败，未生成函数列表")
+                raise Exception(f"{filename} 反编译失败，未生成函数列表{decompile_functions_name_path}")
 
             with open(decompile_functions_name_path, 'r', encoding='utf-8') as f:
                 decompile_functions = f.read().splitlines()
@@ -414,25 +420,72 @@ class NvramServer:
 
         # TODO: 加上各种nvram函数的key_pos，包括set等
         self.nvram_funcs_key_pos = {
+            # Get functions
             "_nvram_get": 0,
+            "nvram_get": 0,
+            "nvram_get_internal": 0,
+            "nvram_get_buf": 0,
+            "nvram_get_int": 0,
+            "nvram_default_get": 0,
             "nvram_nget": 0,
             "nvram_get_state": 0,
+            "nvram_list_exist": 0,
+            "nvram_get_nvramspace": 0,
             "artblock_get": 0,
             "artblock_fast_get": 0,
             "artblock_safe_get": 0,
             "acos_nvram_get": 0,
+            "acos_nvram_read": 0,
             "acosNvramConfig_exist": 0,
             "acosNvramConfig_get": 0,
+            "acosNvramConfig_read": 0,
+            "acosNvramConfig_readAsInt": 0,
             "nvram_get_adv": 1,
             "nvram_bufget": 1,
             "apmib_get": 0,
             "apmib_getDef": 0,
-            "apmib_set": 0,
             "WAN_ith_CONFIG_GET": 1,
             "envram_get": 1,
             "envram_get_func": 1,
             "envram_getf": 0,
-            "nvram_getf": 0
+            "nvram_getf": 0,
+            
+            # Set functions
+            "nvram_set": 0,
+            "nvram_set_int": 0,
+            "nvram_set_state": 0,
+            "nvram_nset": 1,
+            "nvram_nset_int": 1,
+            "nvram_nmatch": 1,
+            "nvram_list_add": 0,
+            "nvram_list_del": 0,
+            "nvram_unset": 0,
+            "artblock_set": 0,
+            "acos_nvram_set": 0,
+            "acosNvramConfig_set": 0,
+            "acosNvramConfig_write": 0,
+            "nvram_set_adv": 2,
+            "nvram_bufset": 2,
+            "apmib_set": 0,
+            "WAN_ith_CONFIG_SET_AS_STR": 1,
+            "WAN_ith_CONFIG_SET_AS_INT": 1,
+            "envram_set": 1,
+            "envram_set_func": 1,
+            "envram_setf": 1,
+            "nvram_setf": 1,
+            
+            # Match functions
+            "nvram_match": 0,
+            "nvram_invmatch": 0,
+            "acosNvramConfig_match": 0,
+            "acosNvramConfig_invmatch": 0,
+            "envram_match": 0,
+            
+            # Other functions with key
+            "foreach_nvram_from": 0,
+            "acos_nvram_unset": 0,
+            "acosNvramConfig_unset": 0,
+            "envram_unset": 1
         }
 
         self.nvram_value_type = {
@@ -553,72 +606,77 @@ Debug mode is disabled; skip checks that might block firmware continuation
 
         visited_files = set()
         total_lines_used = 0
-        key_datas = sorted(self.key_to_func_name[key], key=lambda x: x["total_lines"])
-        for key_data in key_datas:
-            if total_lines_used >= 1000:
-                break
-            function_name_file = key_data["file"]
-            if function_name_file in visited_files:
-                continue
-            visited_files.add(function_name_file)
-            line_num = key_data["line_num"]
-            total_lines = key_data["total_lines"]
-            function_pseudocode_path = os.path.join(
-                self.reverse_dir, function_name_file)
-            if os.path.exists(function_pseudocode_path):
-                with open(function_pseudocode_path, "r") as f:
-                    lines = f.readlines()
-                    header_lines = []
-                    # 函数行数小于100行，直接截取全部代码
-                    if total_lines < 100:
-                        key_snippet_lines = lines
-                    else:
-                        # 找到函数定义的行号，在逆向代码中是函数名第二次出现的行号
-                        base_func_name = function_name_file.replace('.c', '')
-                        func_line = -1
-                        appear_cnt = 0
-                        for idx in range(len(lines)):
-                            if base_func_name in lines[idx]:
-                                appear_cnt += 1
-                                if appear_cnt == 2:
-                                    func_line = idx
-                                    break
-                        # 如果找到函数定义行，则把该行及之前的变量数据信息也加入提示
-                        if func_line > 0:
-                            header_lines = lines[:func_line]
-                        start_line = max(1, line_num - 50)
-                        end_line = min(total_lines, line_num + 49)
-                        key_snippet_lines = lines[start_line - 1:end_line]
-                    
-                    # 合并header与关键代码段，精确防止重叠
-                    combined_lines = []
-                    if header_lines and key_snippet_lines:
-                        # 获取key_snippet_lines的起始行索引
-                        key_start_idx = start_line - 1 if total_lines >= 100 else 0
-                        header_end_idx = len(header_lines)
-                        
-                        # 检查是否有重叠
-                        if key_start_idx < header_end_idx:
-                            # 有重叠，保留header中不重叠的部分 + key_snippet_lines
-                            # header_lines[:key_start_idx] 是不重叠的部分
-                            combined_lines = header_lines[:key_start_idx] + key_snippet_lines
+        # 检查key是否在key_to_func_name字典中
+        if key in self.key_to_func_name:
+            key_datas = sorted(self.key_to_func_name[key], key=lambda x: x["total_lines"])
+            for key_data in key_datas:
+                if total_lines_used >= 1000:
+                    break
+                function_name_file = key_data["file"]
+                if function_name_file in visited_files:
+                    continue
+                visited_files.add(function_name_file)
+                line_num = key_data["line_num"]
+                total_lines = key_data["total_lines"]
+                function_pseudocode_path = os.path.join(
+                    self.reverse_dir, function_name_file)
+                if os.path.exists(function_pseudocode_path):
+                    with open(function_pseudocode_path, "r") as f:
+                        lines = f.readlines()
+                        header_lines = []
+                        # 函数行数小于100行，直接截取全部代码
+                        if total_lines < 100:
+                            key_snippet_lines = lines
                         else:
-                            # 无重叠，直接合并
+                            # 找到函数定义的行号，在逆向代码中是函数名第二次出现的行号
+                            base_func_name = function_name_file.replace('.c', '')
+                            func_line = -1
+                            appear_cnt = 0
+                            for idx in range(len(lines)):
+                                if base_func_name in lines[idx]:
+                                    appear_cnt += 1
+                                    if appear_cnt == 2:
+                                        func_line = idx
+                                        break
+                            # 如果找到函数定义行，则把该行及之前的变量数据信息也加入提示
+                            if func_line > 0:
+                                header_lines = lines[:func_line]
+                            start_line = max(1, line_num - 50)
+                            end_line = min(total_lines, line_num + 49)
+                            key_snippet_lines = lines[start_line - 1:end_line]
+                        
+                        # 合并header与关键代码段，精确防止重叠
+                        combined_lines = []
+                        if header_lines and key_snippet_lines:
+                            # 获取key_snippet_lines的起始行索引
+                            key_start_idx = start_line - 1 if total_lines >= 100 else 0
+                            header_end_idx = len(header_lines)
+                            
+                            # 检查是否有重叠
+                            if key_start_idx < header_end_idx:
+                                # 有重叠，保留header中不重叠的部分 + key_snippet_lines
+                                # header_lines[:key_start_idx] 是不重叠的部分
+                                combined_lines = header_lines[:key_start_idx] + key_snippet_lines
+                            else:
+                                # 无重叠，直接合并
+                                combined_lines = header_lines + key_snippet_lines
+                        else:
                             combined_lines = header_lines + key_snippet_lines
-                    else:
-                        combined_lines = header_lines + key_snippet_lines
-                    
-                    combined_content = ''.join(combined_lines)
-                    # 累加已使用行数
-                    total_lines_used += len(combined_lines)
-                    user_content = user_content + f"\ncode snippet:\n" + \
-                        combined_content + "\n"
+                        
+                        combined_content = ''.join(combined_lines)
+                        # 累加已使用行数
+                        total_lines_used += len(combined_lines)
+                        user_content = user_content + f"\ncode snippet:\n" + \
+                            combined_content + "\n"
 
-        prompt = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ]
-        return prompt
+            prompt = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
+            ]
+            return prompt
+        else:
+            # 如果key不在key_to_func_name字典中，返回None
+            return None
 
     def check_response(self, response_content):
         """
@@ -727,6 +785,11 @@ Debug mode is disabled; skip checks that might block firmware continuation
 
             if num_try == 1:
                 prompt = self.get_related_code(key)
+                # 如果prompt为None，说明key不存在，直接返回默认值
+                if prompt is None:
+                    print(f"[NvramServer] Key {key} not found, returning default response")
+                    default_response = "string "
+                    return default_response
             else:
                 # 在后续尝试中，向系统提示添加之前的失败原因和上次回复
                 if previous_response:
@@ -1255,8 +1318,22 @@ Debug mode is disabled; skip checks that might block firmware continuation
             except Exception as e:
                 print(f"[NvramServer] Failed to save parsed function list: {e}")
 
-        response = self.get_nvram_value(key)
-        self.add_nvram(key, response, function_name)
+        # 检查key是否在key_to_func_name字典中
+        if key not in self.key_to_func_name:
+            # 如果不存在，直接写入空字符串
+            print(f"[NvramServer] Key {key} not found in key_to_func_name, writing empty string")
+            nvram_file_path = os.path.join(self.nvram_dir, key)
+            if not os.path.exists(nvram_file_path):
+                os.makedirs(os.path.dirname(nvram_file_path), exist_ok=True)
+                with open(nvram_file_path, 'w') as file:
+                    file.write('')
+            with open(nvram_file_path, 'wb') as file:
+                # 写入空字符串，类型为string
+                file.write(b'string ')
+        else:
+            # 如果存在，调用大模型获取值
+            response = self.get_nvram_value(key)
+            self.add_nvram(key, response, function_name)
 
         # 处理完成后清理文件
         self.cleanup_files()

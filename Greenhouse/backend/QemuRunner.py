@@ -1036,7 +1036,6 @@ class QemuRunner:
             print(traceback.format_exc())
         finally:
             print("Stopping Container...")
-            tempCont.stop()
 
             # 停止 nvram 服务器线程并统计token
             if hasattr(self, 'nvram_server') and self.nvram_server:
@@ -1049,6 +1048,8 @@ class QemuRunner:
             if hasattr(self, 'nvram_thread') and self.nvram_thread:
                 print("Joining NVRAM Thread...")
                 self.nvram_thread.join(timeout=5)  # 等待线程终止，最多 5 秒
+                
+            tempCont.stop()
 
         print("Emulation Terminated")
         totaltime = time.time() - starttime
