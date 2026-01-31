@@ -6,5 +6,6 @@ JOB_INDEX=$(($3+1))
 SKIP_FLAG=0
 RETRY_FLAG=1
 
+/gh/sshfs_shared.sh
 /gh/docker_init.sh
 /gh/docker_k8_run.sh ${DIR_PATH} ${LIST_PATH} ${JOB_INDEX} ${SKIP_FLAG} ${RETRY_FLAG}
