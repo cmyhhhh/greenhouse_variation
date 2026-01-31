@@ -128,6 +128,13 @@ if [[ $RET_CODE == 124 ]]; then
 	echo "! REHOST TIMEDOUT !" >> ${LOCAL_OUT}
 fi
 
+# Check if exit was due to missing nvram functions
+NO_NVRAM_FLAG=0
+if grep -q "No nvram functions found in binary, exiting without rehosting" ${LOCAL_OUT}; then
+	NO_NVRAM_FLAG=1
+	echo "Detected exit due to missing nvram functions, will not retry" >> ${LOCAL_OUT}
+fi
+
 cp ${LOCAL_PATCH} ${DIR_PATH}/patches/${JOB_INDEX}
 
 if [ -d "/results/${JOB_INDEX}" ]; then
@@ -166,16 +173,21 @@ echo "RETRY_FLAG: " $RETRY_FLAG
 
 if [[ $RETRY_FLAG == "1" ]]; then
 	if [[ $RET_CODE -ne 0 ]]; then
-		if [[ ! -f $RETRY_PATH ]]; then
-			echo 1 > $RETRY_PATH
+		if [[ $NO_NVRAM_FLAG == 1 ]]; then
+			echo "Do not retry on missing nvram exit"
+			echo "Do not retry on missing nvram exit" >> ${LOCAL_OUT}
+		else
+			if [[ ! -f $RETRY_PATH ]]; then
+				echo 1 > $RETRY_PATH
+			fi
+			COUNT=`cat $RETRY_PATH`
+			if [[ COUNT -lt $MAX_RETRIES ]]; then
+				echo "Attempting a retry!"
+				echo $(($COUNT+1)) > $RETRY_PATH
+				exit 42
+			fi
+			echo "No retries left"
 		fi
-		COUNT=`cat $RETRY_PATH`
-		if [[ COUNT -lt $MAX_RETRIES ]]; then
-			echo "Attempting a retry!"
-			echo $(($COUNT+1)) > $RETRY_PATH
-			exit 42
-		fi
-		echo "No retries left"
 	fi
 fi
 

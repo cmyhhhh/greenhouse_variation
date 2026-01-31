@@ -172,6 +172,50 @@ class Greenhouse():
             print("    - Error, unable to find binary path for %s" % img_path)
             return False
 
+        # Check for nvram functions in binary using readelf or strings
+        print("Checking for nvram functions in binary...")
+        nvram_funcs = ["nvram_get", "nvram_get_internal", "nvram_get_buf", "nvram_get_int", "nvram_default_get", "nvram_nget", "nvram_list_exist", "foreach_nvram_from", "nvram_get_nvramspace", "artblock_get", "artblock_fast_get", "artblock_safe_get", "apmib_get", "apmib_getDef", "apmib_set", "WAN_ith_CONFIG_GET", "acos_nvram_get", "acos_nvram_read", "acosNvramConfig_exist", "acosNvramConfig_get", "acosNvramConfig_read", "acosNvramConfig_readAsInt", "nvram_getall_adv", "nvram_get_adv", "envram_get", "envram_get_func", "envram_getf", "nvram_getf", "nvram_bufget", "nvram_safe_get", "_nvram_get", "nvram_get_state"]
+        
+        elf_symbols = ""
+        # Try readelf first
+        try:
+            result = subprocess.run(["readelf", "-s", "--wide", self.bin_path], capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                elf_symbols = result.stdout
+                print(f"Using readelf symbols:{elf_symbols}")
+            else:
+                # Try strings if readelf fails
+                print("readelf failed, trying strings...")
+                result = subprocess.run(["strings", self.bin_path], capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    elf_symbols = result.stdout
+                    print(f"Using strings output:{elf_symbols}")
+                else:
+                    print("Both readelf and strings failed, assuming no NVRAM functions")
+        except Exception as e:
+            print(f"Error running readelf: {e}, trying strings...")
+            try:
+                result = subprocess.run(["strings", self.bin_path], capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    elf_symbols = result.stdout
+                    print("Using strings output")
+                else:
+                    print("Strings also failed, assuming no NVRAM functions")
+            except Exception as e2:
+                print(f"Error running strings: {e2}, assuming no NVRAM functions")
+        
+        # Check if any nvram function exists in the output
+        found_funcs = []
+        for func in nvram_funcs:
+            if func in elf_symbols:
+                found_funcs.append(func)
+        
+        if not found_funcs:
+            print("    - No nvram functions found in binary, exiting without rehosting")
+            return False
+        else:
+            print(f"    - Found nvram functions: {', '.join(found_funcs)}")
+
         # setup for qemu emulation and patching
         self.gh.clean_fs(self.fs_path)
 
@@ -382,11 +426,6 @@ class Greenhouse():
                 firmae.mount_and_cache_fs(IID, self.firmae_path, self.target_cache_path, protected=protected)
                 self.gh.clean_fs(self.target_cache_path)
             
-            # nvram values
-            qemu_log_path = os.path.join(self.firmae_path, "scratch", IID, "qemu.final.serial.log")
-            dest = os.path.join(self.target_cache_path, "qemu.final.serial.log")
-            if os.path.exists(qemu_log_path): # copy nvram values if we can find them
-                Files.copy_file(qemu_log_path, dest)
             if self.cleanup_firmae:
                 firmae.cleanup_IID(IID)
 
@@ -413,16 +452,6 @@ class Greenhouse():
                 success = False
         else:
             print("    - FirmAE Rehost failed, skipping copying...")
-
-        if use_cache or len(IID) > 0:
-            # update nvrams
-            print("    - attempting nvram extraction...")
-            qemu_nvram_logpath = os.path.join(self.target_cache_path, "qemu.final.serial.log")
-            new_nvrams = firmae.extract_lognvram(qemu_nvram_logpath)
-            if new_nvrams is not None:
-                self.gh.fixer.update_nvram_map(new_nvrams)
-                self.gh.fixer.write_nvram(new_nvrams.keys(), self.changelog)
-            print("    - done!")
 
         print("      | [cwdpath]:", cwdpath)
         if cwdpath is None:
@@ -518,7 +547,7 @@ class Greenhouse():
             print("###################### FULLREHOST ######################")
             new_run_args, cwdpath, firmae_success = self.apply_fullsystem_rehost()
             if firmae_success:
-                self.changelog.append("[ROADBLOCK] requires copying of full-system fs/nvram values/runtime args ")
+                self.changelog.append("[ROADBLOCK] requires copying of full-system fs/runtime args ")
             if len(new_run_args) > 0:
                 pslog = "    - replacing runtime extra args " + self.extra_args + " with " + new_run_args
                 print(pslog)
@@ -769,10 +798,10 @@ class Greenhouse():
             if greenhouse_mode and (self.max_cycles < 0 or count < self.max_cycles):
                 ## greenhouse targets
                 skipped = self.gh.transplant(self.fs_path, targets, folders, configs, failed, success, no_skip, self.hackdevproc, self.changelog)
-                mac = self.gh.get_mac_from_nvrams(self.fs_path)
-                nvram_ips = self.gh.get_ips_from_nvram()
-                new_ips = self.gh.parse_ips(self.ip_targets_path, nvram_ips, self.urls)
-                self.urls.extend(list(new_ips))
+                # mac = self.gh.get_mac_from_nvrams(self.fs_path)
+                # nvram_ips = self.gh.get_ips_from_nvram()
+                # new_ips = self.gh.parse_ips(self.ip_targets_path, nvram_ips, self.urls)
+                # self.urls.extend(list(new_ips))
 
                 ## repeat until no targets left or success reached
                 # no further transplants possible
@@ -824,7 +853,7 @@ class Greenhouse():
                 print("Attempting a fullrehost to fix issues...")
                 new_run_args, cwdpath, firmae_success = self.apply_fullsystem_rehost()
                 if firmae_success:
-                    self.changelog.append("[ROADBLOCK] requires copying of full-system fs/nvram values/runtime args ")
+                    self.changelog.append("[ROADBLOCK] requires copying of full-system fs/runtime args ")
                 if len(new_run_args) > 0:
                     pslog = "    - replacing runtime extra args " + self.extra_args + " with " + new_run_args
                     print(pslog)
