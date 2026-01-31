@@ -1149,16 +1149,21 @@ Debug mode is disabled; skip checks that might block firmware continuation
                                         'ssize_t': 'int',
                                     }
 
-                                    # 转换类型 - ensure buf_type is not None before stripping
-                                    stripped_buf_type = buf_type.strip() if buf_type else ''
-                                    converted_type = type_mapping.get(
-                                        stripped_buf_type, 'char')
-                                    # 检查指针类型
-                                    if buf_type and ('*' in buf_type or 'ptr' in buf_type.lower()):
-                                        converted_type = 'char'
-                                    # 检查布尔类型的特殊情况
+                                    # 转换类型 - 遍历 type_mapping 查找匹配的类型
+                                    converted_type = 'char'  # 默认类型
+                                    
+                                    # 先检查布尔类型的特殊情况
                                     if buf_type and ('bool' in buf_type.lower() or '_BOOL' in buf_type):
                                         converted_type = 'bool'
+                                    # 检查指针类型
+                                    elif buf_type and ('*' in buf_type or 'ptr' in buf_type.lower()):
+                                        converted_type = 'char'
+                                    # 遍历 type_mapping 查找匹配的类型
+                                    else:
+                                        for c_type, mapped_type in type_mapping.items():
+                                            if c_type in buf_type:
+                                                converted_type = mapped_type
+                                                break
 
                                     self.apmib_set_var_type[clean_key] = {
                                         "key": clean_key,
@@ -1285,11 +1290,11 @@ Debug mode is disabled; skip checks that might block firmware continuation
                 self.handle_apmib_set()
 
             if key in self.apmib_set_var_type:
-                var_type = self.apmib_set_var_type[key]
+                var_type = self.apmib_set_var_type[key].get("buf_type", "char")
             else:
                 var_type = "char"
 
-            var_type = self.nvram_value_type[var_type]
+            var_type = self.nvram_value_type.get(var_type, self.nvram_value_type["char"])
 
             # 将 var_type 写入容器内的回复文件
             reply_file = f"{self.container_fs_path}/msg_nvram_reply.txt"
@@ -1320,16 +1325,9 @@ Debug mode is disabled; skip checks that might block firmware continuation
 
         # 检查key是否在key_to_func_name字典中
         if key not in self.key_to_func_name:
-            # 如果不存在，直接写入空字符串
+            # 如果不存在，调用add_nvram写入空字符串（无LLM推测）
             print(f"[NvramServer] Key {key} not found in key_to_func_name, writing empty string")
-            nvram_file_path = os.path.join(self.nvram_dir, key)
-            if not os.path.exists(nvram_file_path):
-                os.makedirs(os.path.dirname(nvram_file_path), exist_ok=True)
-                with open(nvram_file_path, 'w') as file:
-                    file.write('')
-            with open(nvram_file_path, 'wb') as file:
-                # 写入空字符串，类型为string
-                file.write(b'string ')
+            self.add_nvram(key, "", function_name)
         else:
             # 如果存在，调用大模型获取值
             response = self.get_nvram_value(key)
