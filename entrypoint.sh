@@ -4,7 +4,7 @@ DIR_PATH=${1}
 LIST_PATH=${2}
 JOB_INDEX=$(($3+1))
 SKIP_FLAG=0
-RETRY_FLAG=1
+RETRY_FLAG=0
 
 /gh/sshfs_shared.sh
 /gh/docker_init.sh

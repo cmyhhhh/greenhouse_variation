@@ -181,12 +181,13 @@ if [[ $RETRY_FLAG == "1" ]]; then
 				echo 1 > $RETRY_PATH
 			fi
 			COUNT=`cat $RETRY_PATH`
-			if [[ COUNT -lt $MAX_RETRIES ]]; then
+			if [[ $COUNT -lt $MAX_RETRIES ]]; then
 				echo "Attempting a retry!"
 				echo $(($COUNT+1)) > $RETRY_PATH
 				exit 42
+			else
+				echo "No retries left"
 			fi
-			echo "No retries left"
 		fi
 	fi
 fi
