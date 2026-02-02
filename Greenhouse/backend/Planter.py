@@ -1,5 +1,6 @@
 from telnetlib import IP
 from . import *
+from .LLMServer import NvramServer
 
 import os, shutil, stat, getpass
 import subprocess
@@ -70,8 +71,25 @@ class Fixer():
         self.brand = brand
         self.clib = "glibc" # default
         self.baseline_mode = baseline_mode
+        self.nvram_server = None
+        self.found_funcs = []
+        self.binary_path = None
+        self.fs_path = None
+
+    def set_found_funcs(self, found_funcs):
+        """
+        设置在二进制文件中找到的 nvram 函数名
+
+        Args:
+            found_funcs: 在二进制文件中找到的 nvram 函数名列表
+        """
+        self.found_funcs = found_funcs
 
     def initial_setup(self, fs_path, binary_path):
+
+        # Store paths as instance variables
+        self.fs_path = fs_path
+        self.binary_path = binary_path
 
         # get architecture involved
         full_path = os.path.join(fs_path, binary_path)
@@ -432,7 +450,12 @@ class Fixer():
         for key, value in new_values.items():
             self.nvram_brand_map[key] = value
 
-    def write_nvram(self, keys, changelog=[]):
+    def write_nvram(self, keys, changelog=[], fs_path=None, binary_path=None):
+        # Use instance variables as defaults if parameters not provided
+        if fs_path is None:
+            fs_path = self.fs_path
+        if binary_path is None:
+            binary_path = self.binary_path
         for key in keys:
             key = key.strip().strip("/")
             if len(key) <= 0:
@@ -451,9 +474,53 @@ class Fixer():
                 changelog.append("[ROADBLOCK] requires NVRAM KEY: %s"  % key)
                 changelog.append("[ROADBLOCK] requires NVRAM VALUE: %s" %  value)
             else:
-                entry = "%s=\n" % (key)
-                changelog.append("[ROADBLOCK] requires NVRAM KEY: %s"  % entry)
-                # entry = ""
+                # 使用 NvramServer 推测值
+                if not self.nvram_server:
+                    try:
+                        print("    - initializing NvramServer for value prediction")
+                        self.nvram_server = NvramServer(
+                            binary_path=binary_path,
+                            fs_path=fs_path
+                        )
+                        # 设置找到的 nvram 函数名
+                        if self.found_funcs:
+                            print(f"    - setting found nvram functions: {', '.join(self.found_funcs)}")
+                            self.nvram_server.set_found_funcs(self.found_funcs)
+                    except Exception as e:
+                        print(f"    ! failed to initialize NvramServer: {e}")
+                
+                if self.nvram_server:
+                    try:
+                        print(f"    - predicting value for nvram key: {key}")
+                        response = self.nvram_server.get_nvram_value(key)
+                        if response:
+                            # 解析 LLM 响应
+                            parts = response.strip().split(" ")
+                            if len(parts) == 2:
+                                value_type, value = parts
+                                # 只需要值部分
+                                if "apmib_get" or "apmib_getDef" in self.found_funcs:
+                                    type_map = {
+                                        "bool": "0",
+                                        "char": "1",
+                                        "short": "2",
+                                        "int": "3",
+                                        "long long": "4"
+                                    }
+                                    if value_type in type_map:
+                                        value = type_map[value_type] + value
+                                    else:
+                                        value = "1" + value
+                                print(f"    - predicted value_type {value_type}, value: {value}")
+                                changelog.append("[ROADBLOCK] requires NVRAM KEY: %s"  % key)
+                                changelog.append("[ROADBLOCK] requires NVRAM VALUE: %s" %  value)
+                    except Exception as e:
+                        print(f"    ! failed to predict nvram value: {e}")
+                
+                if not value:
+                    entry = "%s=\n" % (key)
+                    changelog.append("[ROADBLOCK] requires NVRAM KEY: %s"  % entry)
+            
             print("    - adding nvram key: %s=%s" % (key, value))
             if os.path.isdir(key_path):
                 print("    ! skipping invalid key", key)
@@ -861,8 +928,8 @@ class Planter():
         return sourcefile
 
     def transplant(self, fs_path, targets, folders, configs, failed, already_success, no_skip, hackdevproc, changelog):
-        # print("    - processing nvram configs")
-        # self.fixer.write_nvram(configs, changelog)
+        print("    - processing nvram configs")
+        self.fixer.write_nvram(configs, changelog)
 
         if already_success:
             print("    - already successful, focusing on get working nvrams up")

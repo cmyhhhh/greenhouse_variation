@@ -9,7 +9,6 @@ import json
 import pathlib
 import threading
 
-from .LLMServer import NvramServer
 from . import *
 
 # 
@@ -683,9 +682,6 @@ class QemuRunner:
         timedout = False
         starttime = time.time()
         time_to_up = -1
-        # 初始化token统计变量
-        total_input_token = 0
-        total_output_token = 0
 
         # run container
         try:
@@ -695,11 +691,6 @@ class QemuRunner:
             print(">"*60)
 
             tempCont.start()
-            
-            # start nvram and init llm server in a separate thread
-            self.nvram_server = NvramServer(container_fs_path="/"+DOCKER_FS, binary_path=self.bin_path, container_name=tempCont.name, fs_path=self.fs_path, model="qwen3-max")
-            self.nvram_thread = threading.Thread(target=self.nvram_server.run, args=(0.1,), daemon=True)
-            self.nvram_thread.start()
             
             print("-"*50)
             cmd = "ls %s" % DOCKER_FS
@@ -746,21 +737,8 @@ class QemuRunner:
             traceList = []
             parttrace = []
             running_tally = dict() # running tally tracks "interrupted" loops
-            total_llm_time = 0
             while True:
-                current_llm_time = self.nvram_server.get_time()
-                print(f"Current LLM_time: {current_llm_time}")
-                # 累计LLM推理时间
-                total_llm_time += current_llm_time
-                print(f"Total LLM_time: {total_llm_time}")
-                time.sleep(INTERVAL_SIZE + current_llm_time)
-                
-                # 检查是否有LLM请求，若有则继续等待
-                import glob
-                llm_lock_files = glob.glob("/tmp/llm_request_*")
-                if llm_lock_files:
-                    print(f"Found {len(llm_lock_files)} LLM request lock file(s), waiting for LLM to complete...")
-                    continue
+                time.sleep(INTERVAL_SIZE)
 
                 # perform checker operations
                 probe_success = self.checker.probe(potential_urls, ports) #url, cont
@@ -1037,18 +1015,6 @@ class QemuRunner:
         finally:
             print("Stopping Container...")
 
-            # 停止 nvram 服务器线程并统计token
-            if hasattr(self, 'nvram_server') and self.nvram_server:
-                print("Stopping NVRAM Server...")
-                self.nvram_server.stop()
-                # 统计NVRAM Server的token
-                total_input_token += self.nvram_server.get_total_input_tokens()
-                total_output_token += self.nvram_server.get_total_output_tokens()
-                print(f"NVRAM Server Token Usage - Input: {self.nvram_server.get_total_input_tokens()}, Output: {self.nvram_server.get_total_output_tokens()}")
-            if hasattr(self, 'nvram_thread') and self.nvram_thread:
-                print("Joining NVRAM Thread...")
-                self.nvram_thread.join(timeout=5)  # 等待线程终止，最多 5 秒
-                
             tempCont.stop()
 
         print("Emulation Terminated")
@@ -1128,3 +1094,4 @@ class QemuRunner:
         print("<"*60)
         print("DONE!")
         return self.emulation_output, exitcode, timedout, strace_path, time_to_up
+    

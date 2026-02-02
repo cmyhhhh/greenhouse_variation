@@ -363,15 +363,10 @@ class NvramServer:
     从逆向文件中搜寻对应<FUNTION_NAME>到key_to_func_name.json文件中
     """
 
-    def __init__(self, container_fs_path, binary_path, container_name, fs_path,
-                 reverse_host="10.201.169.58", reverse_port=9998, api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="qwen-plus"):
-        self.container_fs_path = container_fs_path
+    def __init__(self, binary_path, fs_path,
+                 reverse_host="10.201.169.58", reverse_port=9998, api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="qwen3-max"):
         self.reverse_dir = f"/tmp/{os.path.basename(binary_path)}_decompile"
         self.binary_path = binary_path
-        self.communication_file = os.path.join(
-            container_fs_path, "msg_nvram.txt")
-        self.lock_file = os.path.join(container_fs_path, "msg_nvram.lock")
-        self.container_name = container_name
         self.fs_path = fs_path
         self.reverse_host = reverse_host
         self.reverse_port = reverse_port
@@ -418,7 +413,6 @@ class NvramServer:
             except Exception as e:
                 print(f"[NvramServer] Failed to load apmib_set_var_type mapping: {e}")
 
-        # TODO: 加上各种nvram函数的key_pos，包括set等
         self.nvram_funcs_key_pos = {
             # Get functions
             "_nvram_get": 0,
@@ -449,6 +443,7 @@ class NvramServer:
             "envram_get_func": 1,
             "envram_getf": 0,
             "nvram_getf": 0,
+            "nvram_safe_get": 0,
             
             # Set functions
             "nvram_set": 0,
@@ -500,15 +495,8 @@ class NvramServer:
         self.llm_request_count = 0
         # 使用threading.Lock保证线程安全
         self.llm_request_lock = threading.Lock()
-
-        try:
-            self.container = docker.from_env().containers.get(container_name)
-        except docker.errors.NotFound:
-            raise RuntimeError(f"容器 '{container_name}' 不存在，请检查容器名称是否正确")
-        except docker.errors.APIError as e:
-            raise RuntimeError(f"Docker API 调用失败: {e}")
-        except Exception as e:
-            raise RuntimeError(f"获取容器实例时发生未知错误: {e}")
+        # 找到的nvram函数名
+        self.found_funcs = []
 
         # 初始化OpenAI客户端
         self.client = OpenAI(
@@ -518,6 +506,15 @@ class NvramServer:
         self.try_max_num = 3  # Maximum retry attempts
         self.is_error = False
         self.stop_flag = False
+
+    def set_found_funcs(self, found_funcs):
+        """
+        设置在二进制文件中找到的 nvram 函数名
+
+        Args:
+            found_funcs: 在二进制文件中找到的 nvram 函数名列表
+        """
+        self.found_funcs = found_funcs
         
     def get_time(self):
         time = self.consume_time
@@ -561,7 +558,7 @@ Generate a command following this structure (no comments or extra information):
 <value_type> <value>
 
 Parameter definitions:
-<value_type>: Type of the NVRAM value (only int, string, short, long long, bool=true/false)
+<value_type>: Type of the NVRAM value (only int, string, short, long long, bool=1/0)
 <value>: The NVRAM value
 
 Examples:
@@ -709,66 +706,6 @@ Debug mode is disabled; skip checks that might block firmware continuation
         else:
             return False
 
-    def add_nvram(self, key, response_content, function_name):
-        """
-        添加NVRAM值
-
-        Args:
-            key (str): NVRAM key
-            response_content (str): LLM回复内容
-            function_name (str): 调用该函数的nvram函数名
-        """
-        nvram_file_path = os.path.join(self.nvram_dir, key)
-
-        if not os.path.exists(nvram_file_path):
-            # 文件不存在，创建文件夹和文件
-            os.makedirs(os.path.dirname(nvram_file_path), exist_ok=True)
-            with open(nvram_file_path, 'w') as file:
-                file.write('')
-
-        with open(nvram_file_path, 'wb') as file:
-            parts = response_content.strip().split(" ")
-            if len(parts) == 2:
-                value_type, value = parts
-            else:
-                parts = response_content.strip().split("=")
-                if len(parts) == 2:
-                    value_type, value = parts
-                else:
-                    value_type = "string"
-                    value = ""
-
-            # 对于apmib_getDef和apmib_get函数，在内容前面写入值类型
-            if function_name in ["apmib_getDef", "apmib_get"]:
-                # 获取对应的数字类型
-                type_num = self.nvram_value_type.get(
-                    value_type, "1")  # 默认char类型
-                if value_type == "bool":
-                    type_num = self.nvram_value_type["bool"]
-                elif value_type == "string":
-                    type_num = self.nvram_value_type["char"]
-                elif value_type == "int":
-                    type_num = self.nvram_value_type["int"]
-                elif value_type == "short":
-                    type_num = self.nvram_value_type["short"]
-                elif value_type == "long long":
-                    type_num = self.nvram_value_type["long long"]
-
-                # 写入值类型
-                file.write(type_num.encode('utf-8'))
-
-            file.write(value.encode('utf-8'))
-
-        try:
-            tar_stream = io.BytesIO()
-            with tarfile.open(fileobj=tar_stream, mode='w') as tar:
-                tar.add(nvram_file_path, arcname=key)
-            tar_stream.seek(0)
-            self.container.put_archive(path=os.path.join(
-                self.container_fs_path, "gh_nvram"), data=tar_stream.read())
-        except Exception as e:
-            print(f"[NvramServer] Failed to copy gh_nvram to container: {e}")
-
     def get_nvram_value(self, key):
         """
         使用LLM推理获取NVRAM值
@@ -776,6 +713,58 @@ Debug mode is disabled; skip checks that might block firmware continuation
         Args:
             key (str): NVRAM key
         """
+        # 检查二进制文件是否存在
+        if not os.path.exists(self.binary_path):
+            print(f"[NvramServer] Error: File does not exist: {self.binary_path}")
+            default_response = "string "
+            return default_response
+
+        # 检查并执行逆向分析
+        if not self.check_if_reversed():
+            print("[NvramServer] Binary file not reversed, starting reverse analysis...")
+            self.reverse_binary()
+
+        # 生成key_to_func_name.json文件
+        # 使用在二进制文件中找到的nvram函数，生成key_to_func_name映射
+        if self.found_funcs:
+            print(f"[NvramServer] Using found nvram functions: {', '.join(self.found_funcs)}")
+            for func_name in self.found_funcs:                
+                if func_name not in self._parsed_functions:
+                    print(f"[NvramServer] Processing function: {func_name}")
+                    self.generate_key_to_func_json(func_name)
+                    self._parsed_functions.add(func_name)
+                    parsed_funcs_file = os.path.join(
+                        self.reverse_dir, "parsed_functions.json")
+                    try:
+                        with open(parsed_funcs_file, "w") as f:
+                            json.dump(list(self._parsed_functions), f, indent=2)
+                        print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
+                    except Exception as e:
+                        print(f"[NvramServer] Failed to save parsed function list: {e}")
+        else:
+            # 如果没有找到nvram函数，使用默认的nvram函数列表
+            print("[NvramServer] No found nvram functions, using default list")
+            for func_name in self.nvram_funcs_key_pos:                
+                if func_name not in self._parsed_functions:
+                    print(f"[NvramServer] Processing function: {func_name}")
+                    self.generate_key_to_func_json(func_name)
+                    self._parsed_functions.add(func_name)
+                    parsed_funcs_file = os.path.join(
+                        self.reverse_dir, "parsed_functions.json")
+                    try:
+                        with open(parsed_funcs_file, "w") as f:
+                            json.dump(list(self._parsed_functions), f, indent=2)
+                        print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
+                    except Exception as e:
+                        print(f"[NvramServer] Failed to save parsed function list: {e}")
+
+        # 检查key是否在key_to_func_name中
+        if key not in self.key_to_func_name:
+            print(f"[NvramServer] Key {key} not found in key_to_func_name, using default value")
+            default_response = "string "
+            return default_response
+
+        # 使用LLM推理获取NVRAM值
         prompt = []
         num_try = 0
         previous_response = ""
@@ -1243,102 +1232,6 @@ Debug mode is disabled; skip checks that might block firmware continuation
             print(f"[NvramServer] Error parsing communication file: {e}")
             return None, None
 
-    def process_communication_file(self):
-        """
-        处理通信文件
-        """
-        start_time = time.time()
-        try:
-            # 先检查容器是否在运行
-            if self.container.status != 'running':
-                return
-                
-            # 再检查锁文件是否存在，若存在则跳过本次处理
-            exit_code, _ = self.container.exec_run(f"test -f {self.lock_file}")
-            if exit_code == 0:
-                return
-            
-            # 再检查通信文件是否存在
-            exit_code, _ = self.container.exec_run(
-                f"test -f {self.communication_file}")
-            if exit_code != 0:
-                return
-        except Exception as e:
-            print(f"[NvramServer] Error checking container files: {e}")
-            return
-
-        # 创建锁文件，确保互斥访问
-        try:
-            self.container.exec_run(f"touch {self.lock_file}")
-        except Exception as e:
-            print(f"[NvramServer] Failed to create lock file: {e}")
-            return
-
-        # print(f"发现通信文件: {self.communication_file}")
-
-        # 解析文件
-        function_name, key = self.parse_communication_file()
-        if not function_name or not key:
-            # 删除无效文件
-            self.cleanup_files()
-            return
-
-        print(f"[NvramServer] Obtained information: function_name={function_name}, key={key}")
-
-        if function_name == "apmib_set":
-            if not self.apmib_set_var_type:
-                self.handle_apmib_set()
-
-            if key in self.apmib_set_var_type:
-                var_type = self.apmib_set_var_type[key].get("buf_type", "char")
-            else:
-                var_type = "char"
-
-            var_type = self.nvram_value_type.get(var_type, self.nvram_value_type["char"])
-
-            # 将 var_type 写入容器内的回复文件
-            reply_file = f"{self.container_fs_path}/msg_nvram_reply.txt"
-            try:
-                exit_code, output = self.container.exec_run(
-                    f"sh -c 'echo \"{var_type}\" > {reply_file}'")
-                if exit_code == 0:
-                    print(f"[NvramServer] var_type written to reply file in container: {reply_file}")
-                else:
-                    print(
-                        f"[NvramServer] 写入容器内回复文件失败: {output.decode('utf-8', errors='ignore')}")
-            except Exception as e:
-                print(f"[NvramServer] Error writing to reply file in container: {e}")
-            self.cleanup_files()
-            return
-
-        if function_name not in self._parsed_functions:
-            self.generate_key_to_func_json(function_name)
-            self._parsed_functions.add(function_name)
-            parsed_funcs_file = os.path.join(
-                self.reverse_dir, "parsed_functions.json")
-            try:
-                with open(parsed_funcs_file, "w") as f:
-                    json.dump(list(self._parsed_functions), f, indent=2)
-                print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
-            except Exception as e:
-                print(f"[NvramServer] Failed to save parsed function list: {e}")
-
-        # 检查key是否在key_to_func_name字典中
-        if key not in self.key_to_func_name:
-            # 如果不存在，调用add_nvram写入空字符串（无LLM推测）
-            print(f"[NvramServer] Key {key} not found in key_to_func_name, writing empty string")
-            self.add_nvram(key, "", function_name)
-        else:
-            # 如果存在，调用大模型获取值
-            response = self.get_nvram_value(key)
-            self.add_nvram(key, response, function_name)
-
-        # 处理完成后清理文件
-        self.cleanup_files()
-        
-        end_time = time.time()
-        self.consume_time += end_time - start_time
-
     def cleanup_files(self):
         """
         清理通信文件和锁文件（在容器内操作）
@@ -1358,62 +1251,7 @@ Debug mode is disabled; skip checks that might block firmware continuation
                 print(f"[NvramServer] 删除容器内锁文件失败: {output.decode('utf-8', errors='ignore')}") 
         except Exception as e:
             print(f"[NvramServer] Error cleaning container files: {e}")
-    
-    def stop(self):
-        """
-        停止NVRAM LLM推理模块
-        """
-        self.stop_flag = True
-        print("[NvramServer] NVRAM LLM inference module stop flag set")
-        
-        # 等待所有LLM请求结束
-        import time
-        print("[NvramServer] Waiting for all LLM requests to complete...")
-        while True:
-            with self.llm_request_lock:
-                current_count = self.llm_request_count
-            if current_count == 0:
-                break
-            print(f"[NvramServer] Still {current_count} LLM requests in progress, waiting...")
-            time.sleep(5)
-        print("[NvramServer] All LLM requests completed")
 
-
-    def run(self, interval=0.5):
-        """
-        运行NVRAM LLM推理模块
-
-        Args:
-            interval: 检查文件的时间间隔，单位秒，默认0.1秒
-        """
-        print(f"[NvramServer] NVRAM LLM inference module started")
-        print(f"[NvramServer] Monitoring path in container: {self.communication_file}")
-        print(f"[NvramServer] Reverse analysis file directory: {self.reverse_dir}")
-        print(f"[NvramServer] Check interval: {interval} seconds")
-
-        if not os.path.exists(self.binary_path):
-            print(f"[NvramServer] Error: File does not exist: {self.binary_path}")
-            exit(1)
-
-        start_time = time.time()
-        # 启动时检查并逆向二进制文件
-        if not self.check_if_reversed() and self.binary_path:
-            print("[NvramServer] Binary file not reversed, starting reverse analysis...")
-            self.reverse_binary()
-        end_time = time.time()
-        self.consume_time += end_time - start_time
-
-        try:
-            while not self.stop_flag:
-                self.process_communication_file()
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\n[NvramServer] NVRAM LLM inference module stopped")
-        except Exception as e:
-            print(f"[NvramServer] Server runtime error: {e}")
-            self.cleanup_files()
-        finally:
-            print("[NvramServer] NVRAM LLM inference module exited")
 
     def get_total_input_tokens(self):
         """
@@ -1426,3 +1264,4 @@ Debug mode is disabled; skip checks that might block firmware continuation
         获取总输出token数
         """
         return self.total_output_token
+    
