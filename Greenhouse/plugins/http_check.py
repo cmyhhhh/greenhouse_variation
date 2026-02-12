@@ -16,8 +16,8 @@ from requests.auth import HTTPDigestAuth
 
 from .Initializer import *
 
-USER_AUTHS = ['admin', '']
-PASSWORD_AUTHS = ['', 'admin', 'password', '1234']
+USER_AUTHS = ['admin', '', 'nvram_llm']
+PASSWORD_AUTHS = ['', 'admin', 'password', '1234', 'nvram_llm']
 MAX_RETRIES = 3
 
 class URLCheck:
