@@ -41,7 +41,7 @@ echo "--------------------------------------------------------------------"
 
 cd /gh
 # HTTP
-timeout 86400 python3 /gh/gh.py --outpath /gh/results/${SHA256} --workspace /tmp/scratch --firmae /work/FirmAE --logpath=/patches/${SHA256}.log --cache_path=/cache --ip 172.21.0.2 --ports="80,81" --max_cycles=26 -rh --brand=${BRAND} --rehost_type="HTTP" --img_path=/${IMG_PATH} | tee -a /tmp/gh.log
+timeout 86400 python3 /gh/gh.py --outpath /gh/results/${SHA256} -pc --workspace /tmp/scratch --firmae /work/FirmAE --logpath=/patches/${SHA256}.log --cache_path=/cache --ip 172.21.0.2 --ports="80,81" --max_cycles=26 -rh --brand=${BRAND} --rehost_type="HTTP" --img_path=/${IMG_PATH} | tee -a /tmp/gh.log
 RET_CODE=`echo $?`
 
 echo "--------------------------------------------------------------------" 
