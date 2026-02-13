@@ -10,8 +10,7 @@ import pathlib
 import threading
 
 from . import *
-
-# 
+from .LLMServer import InitServer, ContainerPsMonitor, StartupCommandServer
 
 DOCKER_FS = "fs"
 TMP_DIR = "/tmp/greencontainers"
@@ -45,16 +44,14 @@ class QemuRunner:
     TIMEOUT_CODE = 124 # linux timeout return value
     VERBOSE_LOG_TIMEOUT_MULTIPLIER = 5
 
-    def __init__(self, fs_path, bin_path, qemu_arch, hash="", checker=None, 
-                changelog=[], docker_ip="172.20.0.2", baseline_mode=False, hackbind=True, hackdevproc=True, hacksysinfo=True):
-        # 初始化token统计变量
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
+    def __init__(self, fs_path, bin_path, init_path, qemu_arch, hash="", checker=None, 
+                changelog=[], docker_ip="172.20.0.2", baseline_mode=False, hackbind=True, hackdevproc=True, hacksysinfo=True, api_key="", model=""):
         self.fs_path = fs_path
         self.bin_path = bin_path
+        self.init_path = init_path
         self.qemu_arch = qemu_arch
-        self.hash = hash
         self.checker = checker
+        self.hash = hash
         self.changelog = changelog
         self.docker_ip = docker_ip
         self.last_bincwd = "/"
@@ -71,6 +68,11 @@ class QemuRunner:
         self.hackbind = hackbind
         self.hackdevproc = hackdevproc 
         self.hacksysinfo = hacksysinfo 
+        self.api_key = api_key
+        self.model = model
+        
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     def get_token_stats(self):
         """
@@ -422,10 +424,10 @@ class QemuRunner:
         return command
 
 
-    def run(self, delay=120, timeout=HARD_TIMEOUT, extra_args="", nd_args="", bin_cwd="/",
+    def run(self, delay=200, timeout=HARD_TIMEOUT, extra_args="", nd_args="", bin_cwd="/",
             potential_urls=[], ports_file="", bg_cmds=[], bg_sleep=0, interface_cmds=[], 
             mac="",
-            has_ipv6=False, greenhouse_mode=True):
+            has_ipv6=False, greenhouse_mode=True, target_app_startup=None, need_infer_startup=False):
 
         if not os.path.exists(TMP_DIR):
             Files.mkdir(TMP_DIR)
@@ -448,6 +450,7 @@ class QemuRunner:
         logfilename = "/"+TRACE_LOG
         logpath = os.path.join("/",  DOCKER_FS, TRACE_LOG+"1")
         self.relative_bin_path =  self.bin_path.replace(self.fs_path, "")
+        self.relative_init_path = self.init_path.replace(self.fs_path, "")
         self.extra_args = extra_args
         self.nd_args = nd_args
         self.bg_cmds = bg_cmds
@@ -466,11 +469,14 @@ class QemuRunner:
             qemu_command.extend(["-hackproc"])
         if self.hacksysinfo and not self.baseline_mode:
             qemu_command.extend(["-hacksysinfo"])
-        qemu_command.extend(["-D", logfilename+"0"])
-        if greenhouse_mode:
-            qemu_command.extend(["-strace"])
-        else:
-            qemu_command.extend(["-d", "exec,nochain,page"])
+        qemu_command.extend(["-D", "qemu_run_sh_"+TRACE_LOG+"1"])
+        # TODO: greenhouse_mode待处理
+        # if greenhouse_mode:
+        qemu_command.extend(["-strace"])
+        # else:
+        #     qemu_command.extend(["-d", "exec,nochain,page"])
+        
+        # -execve部分参数
         qemu_command.extend(["-execve", "\"/"+self.qemu_arch+" -pconly"])
         if self.hackbind and not self.baseline_mode:
             qemu_command.extend(["-hackbind"])
@@ -478,13 +484,14 @@ class QemuRunner:
             qemu_command.extend(["-hackproc"])
         if self.hacksysinfo and not self.baseline_mode:
             qemu_command.extend(["-hacksysinfo"])
-        if greenhouse_mode:
-            qemu_command.extend(["-strace"])
-        else:
-            qemu_command.extend(["-d", "exec,nochain,page"])
+        # TODO: greenhouse_mode待处理
+        # if greenhouse_mode:
+        qemu_command.extend(["-strace"])
+        # else:
+        #     qemu_command.extend(["-d", "exec,nochain,page"])
         qemu_command.extend(["-D "+logfilename+"\""])
         if not self.baseline_mode:
-            qemu_command.extend(["-E", "LD_PRELOAD=\"libnvram-faker.so\""])
+            qemu_command.extend(["-E", "PATH=\"/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin:/usr/local/bin\"", "-E", "LD_PRELOAD=\"libnvram-faker.so\""])
         qemu_command.extend(["/bin/sh", "qemu_run.sh", ">", "/"+DOCKER_FS+"/"+GREENHOUSE_LOG, "2>&1"])
         # qemu_command.extend(extra_args.split())
         # qemu_command.extend([">", ERROR_LOG])
@@ -506,7 +513,7 @@ class QemuRunner:
             clean_command.extend(["-hacksysinfo"])
         clean_command.extend(["\""])
         if not self.baseline_mode:
-            clean_command.extend(["-E", "LD_PRELOAD=\"libnvram-faker.so\""])
+            clean_command.extend(["-E", "PATH=\"/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin:/usr/local/bin\"", "-E", "LD_PRELOAD=\"libnvram-faker.so\""])
         clean_command.extend(["/bin/sh", "qemu_run.sh"])
         docker_clean_command = " ".join(clean_command)
 
@@ -571,10 +578,14 @@ class QemuRunner:
         ws.close()
         print("done!")
 
+        init_command = "%s %s\n" % ("sh", self.relative_init_path)
+        
         with open(command_script_path, "w") as cs:
+            cs.write("\n")
             cs.write("cd %s\n" % bin_cwd)
             cs.write("\n")
-            cs.write(cwd_command)
+            cs.write(init_command)
+            print("    - running init command")
             cs.write("\n")
         cs.close()
 
@@ -592,12 +603,11 @@ class QemuRunner:
 
         # cleanup old logs
         print("    - cleaning up old traces")
-        for root, dirs, files in os.walk(self.fs_path, topdown=False):
-            for f in files:
-                if TRACE_LOG in f or f.endswith(".trace") or f.endswith(".trace.reversed"):
-                    fpath = os.path.join(root, f)
-                    # print("    - removing old log", fpath)
-                    Files.rm_file(fpath, silent=True)
+        for f in os.listdir(self.fs_path):
+            fpath = os.path.join(self.fs_path, f)
+            if os.path.isfile(fpath) and TRACE_LOG in f:
+                print(f"    - removing old log {fpath}")
+                Files.rm_file(fpath, silent=True)
 
 
         # check for named pipes
@@ -667,10 +677,10 @@ class QemuRunner:
             except Exception as e:
                 print(e)
 
-        strace_path = os.path.join(self.fs_path, TRACE_LOG)
-        if os.path.exists(strace_path):
-            Files.rm_file(strace_path)
-        print("...created! Beginning Emulation.")
+        # strace_path = os.path.join(self.fs_path, TRACE_LOG)
+        # if os.path.exists(strace_path):
+        #     Files.rm_file(strace_path)
+        # print("...created! Beginning Emulation.")
 
         docker_stream = None
         bg_stream = None
@@ -682,15 +692,28 @@ class QemuRunner:
         timedout = False
         starttime = time.time()
         time_to_up = -1
+        total_llm_time = 0.0
+        banned_cmds = set()
+        inferred_startup_cmd = target_app_startup
+        ps_target_app_startup = []
 
         # run container
         try:
             print("Running command: ", docker_command)
-            print("                > ", cwd_command)
+            print("                > ", init_command)
             print("                > CWD: ", bin_cwd)
             print(">"*60)
 
             tempCont.start()
+            
+            import threading
+            self.init_server = InitServer(container_fs_path="/"+DOCKER_FS, container_name=tempCont.name, fs_path=self.fs_path, model="qwen3-max")
+            self.init_thread = threading.Thread(target=self.init_server.run, args=(0.1,), daemon=True)
+            self.init_thread.start()
+            
+            self.container_monitor = ContainerPsMonitor(container_name=tempCont.name, bin_path=self.bin_path, container_fs_path="/"+DOCKER_FS, fs_path=self.fs_path)
+            self.container_monitor_thread = threading.Thread(target=self.container_monitor.run, args=(1,), daemon=True)
+            self.container_monitor_thread.start()
             
             print("-"*50)
             cmd = "ls %s" % DOCKER_FS
@@ -709,25 +732,72 @@ class QemuRunner:
             print("    - delay for %ds" % delay)
             time.sleep(delay)
 
+            # 定义推理并启动目标应用的函数
+            def infer_and_start_target_app():
+                nonlocal inferred_startup_cmd
+                
+                # 如果已经有了目标应用启动命令（通过参数提供），不需要再推理
+                if inferred_startup_cmd:
+                    print(f"Target app startup command already exists: {inferred_startup_cmd}")
+                else:
+                    print("Starting to infer target app startup command...")
+                # 使用StartupCommandServer进行推理
+                startup_server = StartupCommandServer(self.fs_path, self.bin_path, self.qemu_arch, tempCont.name, self.api_key, self.model)
+                inferred_startup_cmd = startup_server.get_target_app_startup(ps_target_app_startup)
+                
+                # 统计 StartupCommandServer 的 token 消耗
+                self.total_input_tokens += startup_server.get_total_input_tokens()
+                self.total_output_tokens += startup_server.get_total_output_tokens()
+                print(f"StartupCommandServer Token Usage - Input: {startup_server.get_total_input_tokens()}, Output: {startup_server.get_total_output_tokens()}")
+                    
+                if not inferred_startup_cmd:
+                    print("Inference did not get a valid target app startup command, skipping...")
+                    return
+            
+                    print(f"Inferred target app startup command: {inferred_startup_cmd}")
+                # Reference command_script_path method, build script and execute
+                print("Executing command in container...")
+                
+                # 创建qemu_run_target.sh脚本文件
+                target_script_path = os.path.join(self.fs_path, "qemu_run_target.sh")
+                print(f"    - creating target script: {target_script_path}")
+                
+                with open(target_script_path, "w") as ts:
+                    ts.write("\n")
+                    ts.write("cd %s\n" % self.last_bincwd)
+                    ts.write(inferred_startup_cmd)
+                    ts.write("\n")
+                    print(f"    - writing inferred startup command to script")
+                
+                # 设置脚本执行权限
+                os.chmod(target_script_path, 0o755)
+                
+                # 在容器中执行目标应用启动脚本
+                target_exec_command = "/bin/sh ./%s/qemu_run_target.sh" % (DOCKER_FS)
+                print(f"    - executing target command: {target_exec_command}")
+                tempCont.exec_run(target_exec_command, stream=False, detach=True, tty=True)
+                print("    - target app startup command executed")
 
-            print("-"*50)
-            cmd = "ps -a"
-            print("Check: ps -a")
-            out = tempCont.exec_run(cmd)[1]
-            print("Processes: ", out)
-            print("-"*50)
+            # print("-"*50)
+            # cmd = "ps -a"
+            # print("Check: ps -a")
+            # out = tempCont.exec_run(cmd)[1]
+            # print("Processes: ", out)
+            # print("-"*50)
 
             # check for changes in tracelog to determine if we are stuck in a loop
             lineCount = 0
             prevCount = -1
             loopCount = 0
             stableCount = 0
+            noTargetCount = 0
             devnulllines = ""
 
             INTERVAL_SIZE = 10 #seconds
             # MAX_LOOPS = HARD_TIMEOUT / INTERVAL_SIZE
             LOOP_THRESHOLD = 10
             STABLE_THRESHOLD = 3
+            NO_TARGET_THRESHOLD = 20 # 无目标应用日志最大检测次数
             # MAX_TAIL = 10000000
             TAIL_SIZE = 10000000
             MAX_TRACES = 200
@@ -738,47 +808,73 @@ class QemuRunner:
             parttrace = []
             running_tally = dict() # running tally tracks "interrupted" loops
             while True:
-                time.sleep(INTERVAL_SIZE)
+                current_llm_time = self.init_server.get_time()
+                print(f"Current LLM_time: {current_llm_time}, Total LLM_time: {total_llm_time}")
+                total_llm_time += current_llm_time
+                time.sleep(INTERVAL_SIZE + current_llm_time)
+                
+                import glob
+                llm_lock_files = glob.glob("/tmp/llm_request_*")
+                if llm_lock_files:
+                    print(f"Found {len(llm_lock_files)} LLM request lock file(s), waiting for LLM to complete...")
+                    noTargetCount = 0
+                    continue
 
+                # 查找所有以目标应用名开头的日志文件
+                lineCount = 0
+                app_name = os.path.basename(self.bin_path)
+                base_logname = f"{app_name}_trace.log"
+                
+                list_cmd = f"ls /{DOCKER_FS}/{base_logname}*"
+                out = tempCont.exec_run(["/bin/sh", "-c", list_cmd])[1].decode().strip()
+                
+                if out and "No such file" not in out:
+                    # 获取所有匹配的日志文件列表
+                    target_log_files = sorted(out.split())
+                else:
+                    target_log_files = []
+                    noTargetCount += 1
+                    if noTargetCount > NO_TARGET_THRESHOLD:
+                        if need_infer_startup:
+                            # 在检测到要退出时，推理并启动目标应用
+                            infer_and_start_target_app()
+                            need_infer_startup = False
+                            continue
+                        time_to_up = (time.time() - runstart) - total_llm_time
+                        print(f"No target log files found for {NO_TARGET_THRESHOLD} consecutive checks! Stopping...")
+                        break
+                    continue
+                
                 # perform checker operations
                 probe_success = self.checker.probe(potential_urls, ports) #url, cont
 
                 if probe_success:
                     print("Response received! Stopping...")
-                    time_to_up = time.time() - runstart
+                    time_to_up = (time.time() - runstart) - total_llm_time
                     break
-
-                print("-"*50)
-                cmd = "ls %s/" % DOCKER_FS
-                out = tempCont.exec_run(cmd)[1]
-                print("/fs: ", out)
-                print("-"*50)
-
-                count = 1
-                tracelogpath = "%s%d" % (logpath[:-1], count)
-                check_cmd = "ls %s" % tracelogpath
-                out = tempCont.exec_run(check_cmd)[1]
-                lineCount = 0
-                while b"No such file" not in out and count < MAX_TRACES:
-                    traceCommand = "wc -l %s" % (tracelogpath)
-                    print("   - checking", tracelogpath)
+                
+                target_log_count = 0
+                for tracelogpath in target_log_files:
+                    # 统计每个日志文件的行数
+                    traceCommand = f"wc -l {tracelogpath}"
+                    print(f"   - checking {tracelogpath}")
                     out = tempCont.exec_run(traceCommand)[1]
                     try:
                         wc_out = str(out)[2:].split()[0]
                         lineCount += int(wc_out)
                     except Exception as e:
-                        print("ERROR - Unable to convert wc for %s" % wc_out)
-                        print(e)
-                    count += 1
-                    tracelogpath = "%s%d" % (logpath[:-1], count)
-                    check_cmd = "ls %s" % tracelogpath
-                    out = tempCont.exec_run(check_cmd)[1]
+                        print(f"ERROR - Unable to convert wc for {wc_out}")
+                        print(str(e))
+                    
+                    target_log_count += 1
+                    if target_log_count > MAX_TRACES:
+                        break
 
                 print("   # ", lineCount, prevCount)
                 if lineCount == prevCount:
                     if stableCount > STABLE_THRESHOLD:
                         print("Run complete! Stopping...")
-                        time_to_up = time.time() - runstart
+                        time_to_up = (time.time() - runstart) - total_llm_time
                         break
                     else:
                         stableCount += 1
@@ -808,45 +904,59 @@ class QemuRunner:
                     return True
 
                 def filter_trace(line):
-                    if b"000/00" in line:
+                    if b"[00000000/00" in line:
                         return True
                     return False
 
-                TAIL_SIZE = TAIL_SIZE * 2
-                end = lineCount
-                start = lineCount - TAIL_SIZE
-                start = max(1, start)
-                print("Running sed -n %d,%d..." % (start, end))
-                traceCommand = "sed -n '%d,%d'p %s" % (start, end, logpath)
-                out = tempCont.exec_run(traceCommand)[1]
-                traceList = out.splitlines()
-                startIndex = 0
-                if not greenhouse_mode:
-                    for line in traceList:
-                        if line.startswith(b"Trace "):
-                            break
-                        startIndex += 1
-                    traceList = traceList[startIndex:]
+                # TODO:检测目标应用的执行轨迹中是否出现无限循环，但判断逻辑是将前半段==后半段，有改进空间
+                print(f"Running to get log content, using tail if needed...")
+                # 使用第一个字典序的日志文件作为判断日志
+                if target_log_files:
+                    logpath = target_log_files[0]
+                    wc_cmd = f"wc -l {logpath}"
+                    wc_output = tempCont.exec_run(wc_cmd)[1].strip()
+                    # Parse the output - the first number is the line count
+                    total_lines = int(wc_output.split()[0] or 0) if wc_output else 0
+                    if total_lines <= TAIL_SIZE:
+                        traceCommand = f"cat {logpath}"
+                    else:
+                        traceCommand = f"tail -n {TAIL_SIZE} {logpath}"
+                    out = tempCont.exec_run(traceCommand)[1]
+                    traceList = out.splitlines()
+                else:
+                    traceList = []
+                    
+                # TODO: greenhouse_mode模式待处理，Trace 是二进制指令执行日志
+                # startIndex = 0
+                # if not greenhouse_mode:
+                #     for line in traceList:
+                #         if line.startswith(b"Trace "):
+                #             break
+                #         startIndex += 1
+                #     traceList = traceList[startIndex:]
 
                 print("Filtering...")
+                # 先过滤最后发生的系统调用
                 traceList = traceList[::-1]
-                if len(list(filter(filter_exec, traceList))) > 0:
-                    traceList = list(filter(filter_exec, traceList))
+                filtered_exec = list(filter(filter_exec, traceList))
+                if filtered_exec:
+                    traceList = filtered_exec
                     traceList = [line.split(b" ", 1)[1].split(b"(", 1)[0] for line in traceList]
-                else:
-                    # use addresses instead
-                    traceList = list(filter(filter_trace, traceList))
-                    traceList = [line.split(b"/", 1)[1] for line in traceList]
+                # else:
+                #     # use addresses instead
+                #     traceList = list(filter(filter_trace, traceList))
+                #     traceList = [line.split(b"/", 1)[1] for line in traceList]
 
                 count = 0
                 looping = False
-                trace_started = False
+                # trace_started = False
                 print("-"*100)
                 # if len(traceList) > 100:
                 #     print(traceList[:100])
                 # else:
                 #     print(traceList)
                 
+                # 检测是否存在循环
                 for line in traceList:
                     backtrace.append(line)
                     partlen = len(backtrace) // 2
@@ -886,16 +996,16 @@ class QemuRunner:
                     print(backtrace[:100])
 
                 if looping:
-                    print("Looping detected! Stopping...")
+                    print("Looping detected! Excessive repetition in execution trace. Stopping...")
                     print(parttrace)
                     timedout = True
-                    time_to_up = time.time() - runstart
+                    time_to_up = (time.time() - runstart) - total_llm_time
                     break
                 time_passed = (time.time() - starttime) / 60 # mins
                 if (time_passed) > timeout: # mins
                     print("HARD_TIMEOUT exceeded, force stop!")
                     timedout = True
-                    time_to_up = time.time() - runstart
+                    time_to_up = (time.time() - runstart) - total_llm_time
                     break
 
                 traceList.clear()
@@ -947,45 +1057,72 @@ class QemuRunner:
             bg_stream = tempCont.exec_run(cmd)[1]      
 
             # get strace results
-            count = 0
-            if not greenhouse_mode:
-                count = 1 # in non-greenhouse mode, focus entirely on main binary
-            tracelogpath = "%s%d" % (logpath[:-1], count)
-            path = "%s.tar%d" % (strace_path, count)
-            cmd = "ls %s" % tracelogpath
-            out = tempCont.exec_run(cmd)[1]
-            while b"No such file" not in out and count < MAX_TRACES:
-                with open(path, "wb") as straceFile:
-                    print("    - retrieving trace", tracelogpath)
-                    s = tempCont.get_archive(tracelogpath)
-                    outputLines = s[0]
-                    for line in outputLines:
-                        straceFile.write(line)
-                    count += 1
-                    tracelogpath = "%s%d" % (logpath[:-1], count)
-                    cmd2 = "ls %s" % tracelogpath
-                    out = tempCont.exec_run(cmd2)[1]
-                    # print("    -", out)
-                straceFile.close()
-                path = "%s.tar%d" % (strace_path, count)
-
-                if not greenhouse_mode:
-                    break # do not bother with following excec trail of subcalls
-
-            strace_path = strace_path+".tar"+"1"
+            # 按照数值顺序排序 trace 文件
+            cmd = "ls /%s/" % DOCKER_FS
+            ls_out = tempCont.exec_run(cmd)[1]
+            
+            if ls_out and b"No such file" not in ls_out:
+                docker_fs_files = ls_out.splitlines()
+                # 筛选出包含 trace.log 的文件
+                trace_files = []
+                for file in docker_fs_files:
+                    if b"trace.log" in file:
+                        trace_files.append(file)
+                
+                # 按照数值顺序排序 trace 文件
+                def sort_key(file):
+                    file_str = file.decode('utf-8')
+                    # 提取前缀和数字部分
+                    if "_trace.log" in file_str:
+                        prefix_part = file_str.split("_trace.log")[0]
+                        # 提取数字部分，如果有的话
+                        number_part = file_str.split("_trace.log")[1] or "0"
+                        # 尝试将数字部分转换为整数
+                        try:
+                            number = int(number_part)
+                        except ValueError:
+                            number = 0
+                        return (prefix_part, number)
+                    return (file_str, 0)
+                
+                # 按数值顺序排序
+                sorted_trace_files = sorted(trace_files, key=sort_key)
+                
+                # 记录相同前缀的出现次数
+                prefix_count = {}
+                # 处理所有 trace 文件
+                for file in sorted_trace_files:
+                    file_str = file.decode('utf-8')
+                    # 提取 _trace.log 前的部分作为前缀
+                    prefix = file_str.split("_trace.log")[0]
+                    prefix_count[prefix] = prefix_count.get(prefix, 0) + 1
+                    # 如果同一前缀已出现 MAX_TRACES 次，则跳过
+                    if prefix_count[prefix] > MAX_TRACES:
+                        continue
+                    print(f"    - retrieving trace {file}")
+                    docker_path = os.path.join(DOCKER_FS, file_str)
+                    path = f"{self.fs_path}/{file_str}.tar"
+                    with open(path, "wb") as straceFile:
+                        archive = tempCont.get_archive(docker_path)
+                        for line in archive[0]:
+                            straceFile.write(line)
 
             cmd = "ls /%s" % DOCKER_FS
             traceFiles = tempCont.exec_run(cmd)[1].splitlines()
             print("Cleaning up...")
             # make sure to kill everything
             pids = []
-            out = tempCont.exec_run("ps -a")[1]
+            out = tempCont.exec_run("ps -efww")[1]
+            app_name = os.path.basename(self.bin_path)
             for process in out.splitlines():
-                print("    - ", process)
-                if b"ps -a" in process:
+                print(f"    - {process}")
+                if b"ps -efww" in process:
                     continue
+                # 过滤出目标应用的启动进程
+                if app_name.encode() in process:
+                    ps_target_app_startup.append(process)
                 fields = process.split()
-                pid = fields[0]
+                pid = fields[1]
                 if pid.isdigit():
                     pid = int(pid)
                     if pid > 1:
@@ -1014,12 +1151,35 @@ class QemuRunner:
             print(traceback.format_exc())
         finally:
             print("Stopping Container...")
+            
+            if hasattr(self, 'init_server') and self.init_server:
+                print("Stopping Init Server...")
+                self.init_server.stop()
+                self.total_input_tokens += self.init_server.get_total_input_tokens()
+                self.total_output_tokens += self.init_server.get_total_output_tokens()
+                # 获取已过滤的脚本集合
+                filtered_scripts = self.init_server.get_filtered_scripts()
+                print(f"Init Server Token Usage - Input: {self.init_server.get_total_input_tokens()}, Output: {self.init_server.get_total_output_tokens()}")
+            if hasattr(self, 'init_thread') and self.init_thread:
+                print("Joining Init Thread...")
+                self.init_thread.join(timeout=5)
+            
+            if hasattr(self, 'container_monitor') and self.container_monitor:
+                print("Stopping ContainerPsMonitor...")
+                self.container_monitor.stop()
+                # 获取被禁止的命令列表
+                banned_cmds = self.container_monitor.get_banned_cmds()
+            if hasattr(self, 'container_monitor_thread') and self.container_monitor_thread:
+                print("Joining ContainerPsMonitor Thread...")
+                self.container_monitor_thread.join(timeout=5)
 
             tempCont.stop()
 
         print("Emulation Terminated")
         totaltime = time.time() - starttime
         print("    - emulation time = ", (totaltime / 60), "mins")
+        print(f"    - Total Token Usage - Input: {self.total_input_tokens}, Output: {self.total_output_tokens}")
+        print(f"    - Total Tokens: {self.total_input_tokens + self.total_output_tokens}")
 
         if bg_stream:
             print("----- bg output -----")
@@ -1093,5 +1253,6 @@ class QemuRunner:
 
         print("<"*60)
         print("DONE!")
-        return self.emulation_output, exitcode, timedout, strace_path, time_to_up
+        
+        return self.emulation_output, exitcode, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts
     

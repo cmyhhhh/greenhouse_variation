@@ -1,3 +1,4 @@
+import shutil
 from socket import has_ipv6
 from telnetlib import IP
 from backend import *
@@ -52,11 +53,21 @@ class Greenhouse():
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.sha256hash = ""
+        
+        # llm
+        self.api_key = args.api_key
+        self.model = args.model
+        
+        # 目标应用的启动命令
+        self.target_app_startup = None
+        # 是否需要额外单独启动目标应用
+        self.is_target_app = False
 
         # flags
         self.rehost_first = args.rehost_first
         self.repeat = not args.norepeat
         self.diagnose_only = args.diagnose
+        self.nopatch = args.nopatch
         self.strict = not args.nostrict
         self.hackbind = not args.nohack_bind
         self.hackdevproc = not args.nohack_devproc
@@ -64,7 +75,7 @@ class Greenhouse():
         self.skip_fullsystem = args.nofullrehosting
         self.cleanup_firmae = not args.nocleanupfirmae
         self.baseline = args.baseline
-        self.nodaemon = not args.nodedaemon
+        self.enable_dedaemon = not args.nodedaemon
         self.rh_success = False
         self.ps_success = False
         self.cwd_success = False
@@ -73,6 +84,7 @@ class Greenhouse():
         self.img_path = args.img_path
         self.fs_path = ""
         self.bin_path = ""
+        self.init_path = ""
         self.qemu_path = ""
         self.qemu_arch = ""
 
@@ -82,6 +94,9 @@ class Greenhouse():
         self.ports = self.ports_base.copy()
         self.extra_args = args.bin_args
         self.extra_args_base = args.bin_args
+        self.no_extra_args = args.no_extra_args
+        self.no_bg_scripts = args.no_bg_scripts
+        self.no_bintrunk = args.no_bintrunk
         self.timeout = args.timeout
         self.bg_scripts = dict()
         self.rehost_type = self.get_rehost_type(args.rehost_type)
@@ -93,6 +108,7 @@ class Greenhouse():
         self.target_bin_override = ""
         self.fs_path = ""
         self.bin_path = ""
+        self.init_path = ""
         self.qemu_path = ""
         self.qemu_arch = ""
         self.logpath = ""
@@ -161,7 +177,7 @@ class Greenhouse():
 
         # find target binary to run
         if self.target_bin_override == "":
-            self.bin_path = self.gh.get_target_binary(self.fs_path, self.rehost_type)
+            self.bin_path, self.init_path = self.gh.get_target_binary_and_init(self.fs_path, self.rehost_type)
         else:
             if self.fs_path not in self.target_bin_override:
                 self.target_bin_override = self.target_bin_override.strip("/")
@@ -170,6 +186,10 @@ class Greenhouse():
 
         if self.bin_path == "":
             print("    - Error, unable to find binary path for %s" % img_path)
+            return False
+        
+        if self.init_path == "":
+            print("Error, unable to find init path for %s" % img_path)
             return False
 
         # setup for qemu emulation and patching
@@ -250,7 +270,7 @@ class Greenhouse():
         
         if not found_funcs:
             print("    - No nvram functions found in binary, exiting without rehosting")
-            return False
+            # return False
         else:
             print(f"    - Found nvram functions: {', '.join(found_funcs)}")
             # 将找到的 nvram 函数名传递给 Fixer 类
@@ -562,7 +582,7 @@ class Greenhouse():
         self.ip_targets_path = os.path.join(self.fs_path, "target_urls")
         self.ports_path = os.path.join(self.fs_path, "target_ports")
 
-        if self.nodaemon:
+        if self.enable_dedaemon:
             needs_dedaemon = True
         else:
             patch_blacklist = ["daemon_fork"]
@@ -572,13 +592,17 @@ class Greenhouse():
 
         checker = self.get_checker()
         sparser = TraceParser(fs_path=self.fs_path)
-        patcher = Patcher(blacklist=patch_blacklist)
-        self.runner = QemuRunner(self.fs_path, self.bin_path, self.qemu_arch, self.sha256hash,
+        patcher = None
+        if not self.nopatch:
+            patcher = Patcher(blacklist=patch_blacklist)
+        self.runner = QemuRunner(self.fs_path, self.bin_path, self.init_path, self.qemu_arch, self.sha256hash,
                                  checker, changelog=self.changelog, docker_ip=self.docker_ip,
                                  baseline_mode=self.baseline,
                                  hackbind=self.hackbind,
                                  hackdevproc=self.hackdevproc,
-                                 hacksysinfo=self.hacksysinfo)
+                                 hacksysinfo=self.hacksysinfo,
+                                 api_key=self.api_key,
+                                 model=self.model)
         
         # setup ip targets
         if not os.path.exists(self.ip_targets_path):
@@ -592,7 +616,8 @@ class Greenhouse():
             greenhouse_mode = False
 
         # setup background scripts
-        self.bg_scripts = self.get_background_plugins()
+        if not self.no_bg_scripts:
+            self.bg_scripts = self.get_background_plugins()
 
         new_run_args = ""
         if self.rehost_first and len(self.firmae_path) > 0:
@@ -600,7 +625,7 @@ class Greenhouse():
             new_run_args, cwdpath, firmae_success = self.apply_fullsystem_rehost()
             if firmae_success:
                 self.changelog.append("[ROADBLOCK] requires copying of full-system fs/nvram values/runtime args ")
-            if len(new_run_args) > 0:
+            if len(new_run_args) > 0 and not self.no_extra_args:
                 pslog = "    - replacing runtime extra args " + self.extra_args + " with " + new_run_args
                 print(pslog)
                 if self.extra_args.strip() != new_run_args.strip():
@@ -620,14 +645,17 @@ class Greenhouse():
 
         if not fullrehosted or len(new_run_args) <= 0:
             # check for command-line args like conf paths/flags
-            print("    - checking for cl_args...")
-            command_args = self.gh.setup_cl_args(self.brand, self.fs_path, self.bin_path, self.changelog, self.extra_args_base, self.rehost_type)
-            self.extra_args = self.extra_args_base
-            for arg in command_args:
-                if arg not in self.extra_args:
-                    self.extra_args += " %s" % arg
+            if not self.no_extra_args:
+                print("    - checking for cl_args...")
+                command_args = self.gh.setup_cl_args(self.brand, self.fs_path, self.bin_path, self.changelog, self.extra_args_base, self.rehost_type)
+                self.extra_args = self.extra_args_base
+                for arg in command_args:
+                    if arg not in self.extra_args:
+                        self.extra_args += " %s" % arg
+            else:
+                print("    - extra args mechanism disabled, using only provided bin_args")
 
-        if not self.baseline:
+        if not self.baseline and not self.no_bg_scripts:
             print("Extracting bg script commands...")
             bin_paths = self.get_bin_paths()
             for name, bg in self.bg_scripts.items():
@@ -637,6 +665,10 @@ class Greenhouse():
                     bg_cmds.extend(cmds)
                     bg_sleep += sleeptime
             print("...done!")
+        elif self.no_bg_scripts:
+            print("    - background scripts mechanism disabled")
+            bg_cmds = []
+            bg_sleep = 0
 
         while True:
             label = "###################### PATCH LOOP [%d] ######################" % count
@@ -645,78 +677,153 @@ class Greenhouse():
             print(label)
             time_to_up = -1
             count += 1
-            ## run target binary in docker via qemu-user
-            emulation_output, exit_code, timedout, trace_path, time_to_up = self.runner.run(timeout=self.timeout, bin_cwd=bin_cwd,
-                                                                            potential_urls=self.urls,
-                                                                            ports_file=self.ports_path,
-                                                                            extra_args=self.extra_args,
-                                                                            nd_args=nodaemon_args,
-                                                                            bg_cmds=bg_cmds,
-                                                                            bg_sleep=bg_sleep,
-                                                                            interface_cmds=interface_cmds,
-                                                                            mac=mac,
-                                                                            has_ipv6=has_ipv6,
-                                                                            greenhouse_mode=greenhouse_mode)
+            # init脚本无法启动目标应用，则额外启动目标应用         
+            # 确定是否需要推理目标应用启动命令
+            need_infer_startup = self.is_target_app
+            
+            # run target binary in docker via qemu-user
+            if self.is_target_app:
+                emulation_output, exit_code, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts = self.runner.run(timeout=self.timeout, bin_cwd=bin_cwd,
+                                                                                                potential_urls=self.urls,
+                                                                                                ports_file=self.ports_path,
+                                                                                                extra_args=self.extra_args,
+                                                                                                nd_args=nodaemon_args,
+                                                                                                bg_cmds=bg_cmds,
+                                                                                                interface_cmds=interface_cmds,
+                                                                                                mac=mac,
+                                                                                                has_ipv6=has_ipv6,
+                                                                                                greenhouse_mode=greenhouse_mode,
+                                                                                                need_infer_startup=need_infer_startup,
+                                                                                                target_app_startup=self.target_app_startup)
+                if inferred_startup_cmd:
+                    self.target_app_startup = inferred_startup_cmd
+            # 仅启动init脚本，不额外启动目标应用
+            else:
+                emulation_output, exit_code, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts = self.runner.run(timeout=self.timeout, bin_cwd=bin_cwd,
+                                                                                                potential_urls=self.urls,
+                                                                                                ports_file=self.ports_path,
+                                                                                                extra_args=self.extra_args,
+                                                                                                nd_args=nodaemon_args,
+                                                                                                bg_cmds=bg_cmds,
+                                                                                                interface_cmds=interface_cmds,
+                                                                                                mac=mac,
+                                                                                                has_ipv6=has_ipv6,
+                                                                                                greenhouse_mode=greenhouse_mode,
+                                                                                                need_infer_startup=need_infer_startup)
+                if inferred_startup_cmd:
+                    self.target_app_startup = inferred_startup_cmd
+                    
             print("Exit code", exit_code, "timedout", timedout)
-
-            # generate program trace
-            trace_json_path = trace_path.rsplit(".", 1)[0] + ".json"
-            parse_success = sparser.convert(trace_path, trace_json_path)
-            if not parse_success:
-                print("    - failed to parse trace_path")
-                break
-            trace = Trace(trace_json_path)
-
             errored = exit_code in self.runner.ERROR_CODES
+            
+            if banned_cmds:
+                print(f"Banned commands: {banned_cmds}")
 
-            # bintrunk mode only
-            if self.trunk_only:
-                self.generate_bintrunk(trace_json_path, trace, always_rebuild=True)
-                if self.batchfolder_path:
-                    Files.rm_files([trace_path, trace_json_path])
-                print("    - generate_bintrunk complete.")
-                break
+            # TODO: bintrunk相关没有实现，即使用qemu指令日志来强打patch的功能
+            # # generate program trace
+            # trace_json_path = trace_path.rsplit(".", 1)[0] + ".json"
+            # parse_success = sparser.convert(trace_path, trace_json_path)
+            # if not parse_success:
+            #     print("    - failed to parse trace_path")
+            #     break
+            # trace = Trace(trace_json_path)
+
+            # # bintrunk mode only
+            # if self.trunk_only:
+            #     if not self.no_bintrunk:
+            #         self.generate_bintrunk(trace_json_path, trace, always_rebuild=True)
+            #         if self.batchfolder_path:
+            #             Files.rm_files([trace_path, trace_json_path])
+            #         print("    - generate_bintrunk complete.")
+            #     else:
+            #         print("    - bintrunk disabled, skipping...")
+            #     break
 
             last_mac = mac
             last_failed = failed.copy()
             last_targets = targets.copy()
             last_configs = configs.copy()
             last_folders = folders.copy()
+            last_banned_cmds = banned_cmds.copy()
+            last_filtered_scripts = filtered_scripts.copy()
             forkmap = dict()
             is_daemonized = False
 
-            ## gather filesystem and nvram targets
-            targets, folders, configs, ip_addrs, ipv6_addrs, ports, interfaces, failed, segfaulted, is_daemonized = sparser.parse(emulation_output, trace_path, forkmap=forkmap)
-            if segfaulted:
-                errored = True
-                exit_code = -11
+            # gather filesystem and nvram targets
+            # targets: 访问但失败的文件，但不是.so库文件、/dev/mtdblock设备或.ko内核模块，是failed子集
+            # folders: 尝试以O_DIRECTORY标志打开但失败的目录路径集合
+            # configs: 从emulation_dump中提取的NVRAM缺失数据key集合
+            # ip_addrs: 从emulation_dump中提取的有效的IPv4地址集合，这些地址由[FirmAgentQEMU]标记
+            # ipv6_addrs: 从emulation_dump中提取的IPv6地址集合，这些地址由[FirmAgentQEMU]标记
+            # ports: 从emulation_dump中提取的端口号集合，这些端口号由[FirmAgentQEMU]标记
+            # interfaces: 从emulation_dump中提取的网络接口设备集合，这些接口由[FirmAgentQEMU]标记的BIND_DEVICE信息获取
+            # failed: 所有尝试打开但失败的文件路径集合（不包括目录）
+            # segfaulted: 如果emulation_dump中包含"SIGSEGV"，则为True，表示程序发生了段错误
+            # is_daemonized: 如果程序调用了fork并退出，则为True，表示程序以守护进程方式运行
+            # 判断 self.fs_path 文件夹下是否存在目标应用日志
+            targets, folders, configs, ip_addrs, ipv6_addrs, ports, interfaces, failed, segfaulted, is_daemonized = set(), set(), set(), set(), set(), set(), set(), set(), False, False
+            binary_name = os.path.basename(self.bin_path)
+            log_prefix = f"{binary_name}_trace.log"
+            trace_path_full = os.path.join(self.fs_path, f"{log_prefix}1.tar")
+            if not os.path.exists(trace_path_full):
+                print(f"target log file not found: {trace_path_full}")
+            else:
+                # 解析所有以 {binary_name}_trace.log 开头的日志文件
+                try:
+                    all_files = os.listdir(self.fs_path)
+                    for fname in all_files:
+                        if fname.startswith(log_prefix):
+                            extra_log = os.path.join(self.fs_path, fname)
+                            subtargets, subfolders, subconfigs, subip_addrs, subipv6_addrs, sub_ports, subinterfaces, subfailed, subfaulted, _ = sparser.parse(
+                                "", extra_log, forkmap=forkmap)
+                            targets.update(subtargets)
+                            folders.update(subfolders)
+                            configs.update(subconfigs)
+                            ip_addrs.update(subip_addrs)
+                            ipv6_addrs.update(subipv6_addrs)
+                            ports.update(sub_ports)
+                            interfaces.update(subinterfaces)
+                            failed.update(subfailed)
+                            segfaulted = subfaulted
+                            if segfaulted:
+                                errored = True
+                                exit_code = -11
+                except Exception as e:
+                    print(f"解析额外 {log_prefix} 日志时出错: {str(e)}")
 
-            # process subcall traces for missing files
-            subcount = 0
-            basetracepath = trace_path[:-1]
-            subpath = "%s%d" % (basetracepath, subcount)
-            print("Processing subtraces...")
-            while os.path.exists(subpath):
-                if subcount == 1:
-                    subcount += 1
-                    subpath = "%s%d" % (basetracepath, subcount)
-                    continue
-                subtargets, subfolders, subconfigs, subip_addrs, subipv6_addrs, sub_ports, subinterfaces, subfailed, subfaulted, _ = sparser.parse("", subpath, forkmap=forkmap)
-                targets.update(subtargets)
-                folders.update(subfolders)
-                configs.update(subconfigs)
-                ip_addrs.update(subip_addrs)
-                ipv6_addrs.update(subipv6_addrs)
-                ports.update(sub_ports)
-                interfaces.update(subinterfaces)
-                failed.update(subfailed)            
-                if subfaulted:
-                    errored = True
-                    exit_code = -11
-                # we don't need to track extra failed libs here
-                subcount += 1
-                subpath = "%s%d" % (basetracepath, subcount)
-            print("exit_code", exit_code, "timeout", timedout, "errored", errored)
+            # process log files containing trace.log in trace_path
+            print("Processing other trace.log files...")
+            # 获取trace_path目录下包含"trace.log"的所有文件
+            try:
+                all_files = os.listdir(self.fs_path)
+                trace_log_files = [f for f in all_files if "trace.log" in f and not f.startswith(log_prefix)]
+
+                if trace_log_files and "No such file" not in trace_log_files[0]:
+                    print(f"Found {len(trace_log_files)} trace.log files: {trace_log_files}")
+
+                    for log_file in trace_log_files:
+                        log_file_path = os.path.join(self.fs_path, log_file)
+                        subtargets, subfolders, subconfigs, subip_addrs, subipv6_addrs, sub_ports, subinterfaces, subfailed, subfaulted, _ = sparser.parse(
+                            "", log_file_path, forkmap=forkmap)
+                        targets.update(subtargets)
+                        folders.update(subfolders)
+                        configs.update(subconfigs)
+                        # ip_addrs.update(subip_addrs)
+                        # ipv6_addrs.update(subipv6_addrs)
+                        # ports.update(sub_ports)
+                        interfaces.update(subinterfaces)
+                        failed.update(subfailed)
+                        if subfaulted:
+                            errored = True
+                            exit_code = -11
+                else:
+                    print("No trace.log files found in trace_path")
+                    
+            except Exception as e:
+                print(f"Error processing trace.log files: {str(e)}")
+                
+            print("exit_code " + str(exit_code) + "; timeout " +
+                  str(timedout) + "; errored " + str(errored))
             
             print("    - [targets]: ")
             print("    - ", targets)
@@ -741,16 +848,16 @@ class Greenhouse():
             success = False
             wellformed = False
             connected = False
-            success, wellformed, connected = checker.check(trace, exit_code, timedout, errored, self.strict)
+            success, wellformed, connected = checker.check(exit_code, timedout, errored, self.strict)
             print("  - [connected]:", connected)
             print("  - [success]:", success)
             print("  - [wellformed]:", wellformed)
 
-            # check for threading/child procs
-            if subcount > 2:
-                self.changelog.append("[ROADBLOCK] requires multi-threading/child-processes to handle server response")
-                sublog = "    - %d subtargets" % (subcount-1)
-                self.changelog.append(sublog)
+            # # check for threading/child procs
+            # if subcount > 2:
+            #     self.changelog.append("[ROADBLOCK] requires multi-threading/child-processes to handle server response")
+            #     sublog = "    - %d subtargets" % (subcount-1)
+            #     self.changelog.append(sublog)
 
             ## check for different root dir
             changed_cwd, bin_cwd = self.gh.check_cwd(self.fs_path, targets, bin_cwd, cwd_rh_replaced, success)
@@ -800,10 +907,10 @@ class Greenhouse():
             if (len(new_ips) == 0 and last_mac == mac and not changed_cwd and \
                 (self.partial_configs or len(configs) == 0 or configs == last_configs)):
                 if success and not needs_nodaemon_patch: # no obvious transplants left and success was reached
-                    if not greenhouse_mode:
-                        print("    - rehost done, rerunning in greenhouse mode to finalize...")
-                        greenhouse_mode = True
-                        continue
+                    # if not greenhouse_mode:
+                    #     print("    - rehost done, rerunning in greenhouse mode to finalize...")
+                    #     greenhouse_mode = True
+                    #     continue
 
                     # nodaemon flag guessing
                     if needs_dedaemon and is_daemonized and ndflag_index < len(nd_flags):
@@ -816,13 +923,19 @@ class Greenhouse():
                         print("    - nodaemon flag successful...")
                         needs_dedaemon = False
                     elif needs_dedaemon and ndflag_index == len(nd_flags):
-                        print("    - unable to find nodaemon flag, engaging patcher...")
-                        nodaemon_args = ""
-                        needs_dedaemon = False
-                        needs_nodaemon_patch = True
-                        patcher = Patcher(whitelist="daemon_fork")
-                        greenhouse_mode = False
-                        continue
+                        if self.nopatch:
+                            print("    - nodaemon patching disabled by --nopatch flag")
+                            nodaemon_args = ""
+                            needs_dedaemon = False
+                            continue
+                        else:
+                            print("    - unable to find nodaemon flag, engaging patcher...")
+                            nodaemon_args = ""
+                            needs_dedaemon = False
+                            needs_nodaemon_patch = True
+                            patcher = Patcher(whitelist="daemon_fork")
+                            greenhouse_mode = False
+                            continue
 
                     success_msg = "Success, filesystem runs!"
                     rehost_result = "SUCCESS"
@@ -847,7 +960,7 @@ class Greenhouse():
                 break
 
 
-            if greenhouse_mode and (self.max_cycles < 0 or count < self.max_cycles):
+            if self.max_cycles < 0 or count < self.max_cycles:
                 ## greenhouse targets
                 skipped = self.gh.transplant(self.fs_path, targets, folders, configs, failed, success, no_skip, self.hackdevproc, self.changelog)
                 mac = self.gh.get_mac_from_nvrams(self.fs_path)
@@ -856,31 +969,33 @@ class Greenhouse():
                 self.urls.extend(list(new_ips))
 
                 ## repeat until no targets left or success reached
-                # no further transplants possible
-                if len(targets) == 0 and len(folders) == 0 and len(configs) == 0 and len(new_ips) == 0 and last_mac == mac and not changed_cwd:
-                    # no transplants left but no success, engage patching
-                    print("    - no transplants left to try, engage patching")
-                    if greenhouse_mode or self.repeat:
-                        greenhouse_mode = False
-                        print("    - rerunning...")
-                        continue # repeat with flag set
+                # 如果没有可修复的问题，且没有新的IP、文件夹、目标应用、MAC地址、脚本禁止名单没有变化，就退出
+                if len(targets) == 0 and len(folders) == 0 and len(configs) == 0 and len(new_ips) == 0 and last_mac == mac and not changed_cwd and banned_cmds == last_banned_cmds and filtered_scripts == last_filtered_scripts:
+                    # 如果目标应用日志不存在且修复手段用完也没有潜在的修复点，就需要推测目标应用启动命令，尝试单应用启动
+                    if not self.is_target_app:
+                        self.is_target_app = True
+                        count = 0
+                        continue
+                    print("    - no fixable issues left to try, exit")
+                    if self.repeat:
+                        break
                     else:
-                        # already in patch mode or not meant to repeat, end
-                        print("    - cycle complete...")
                         return 0
 
-                # break out of infinite greenhouse loop in case where greenhousing does not seem to change anything
+                # 如果剩余的修复问题无法被修复，则退出
                 if not changed_cwd and last_mac == mac and len(new_ips) == 0: # no ips or cwd changes
                     if targets == last_targets and last_folders == folders and \
-                       last_failed == failed and last_configs == configs: #attempted fs fixing failed, skip and continue anywayz
-                        print("    - no change in failed cases despite greenhousing, skip to patching")
-                        if greenhouse_mode or self.repeat:
-                            greenhouse_mode = False
-                            print("    - rerunning...")
-                            continue # repeat with flag set
+                       last_failed == failed and last_configs == configs and banned_cmds == last_banned_cmds and filtered_scripts == last_filtered_scripts: #attempted fs fixing failed, skip and continue anywayz
+                        # 如果目标应用日志不存在且修复手段用完也没有潜在的修复点，就需要推测目标应用启动命令，尝试单应用启动
+                        if not self.is_target_app:
+                            self.is_target_app = True
+                            count = 0
+                            continue
+                        print(
+                            "    - no change in failed cases despite firmagent running, cycle complete...")
+                        if self.repeat:
+                            break
                         else:
-                            # already in patch mode or not meant to repeat, end
-                            print("    - cycle complete...")
                             return 0
 
                 # further transplants possible, keep greenhousing
@@ -896,8 +1011,8 @@ class Greenhouse():
                 print("[Greenhouse] !! MAX CYCLES %d REACHED !!" % count)
                 if connected and not wellformed:
                     rehost_result = "PARTIAL"
-                if self.batchfolder_path:
-                    Files.rm_files([trace_path, trace_json_path])
+                # if self.batchfolder_path:
+                #     Files.rm_files([trace_path, trace_json_path])
                 break
 
             ## first, try to obtain more configs from fullrehosting
@@ -906,7 +1021,7 @@ class Greenhouse():
                 new_run_args, cwdpath, firmae_success = self.apply_fullsystem_rehost()
                 if firmae_success:
                     self.changelog.append("[ROADBLOCK] requires copying of full-system fs/nvram values/runtime args ")
-                if len(new_run_args) > 0:
+                if len(new_run_args) > 0 and not self.no_extra_args:
                     pslog = "    - replacing runtime extra args " + self.extra_args + " with " + new_run_args
                     print(pslog)
                     if self.extra_args.strip() != new_run_args.strip():
@@ -927,38 +1042,50 @@ class Greenhouse():
                 fullrehosted = True
                 print("    - rerunning...")
                 continue
+            
+            # TODO: 补丁模式暂不支持
+            # ## if no targets left and success not reached, attempt patch
+            # ## generate bintrunk of target binary
+            # trace_trunk_path = []
+            # index = -1
+            # if not self.no_bintrunk:
+            #     trace_trunk_path, index = self.generate_bintrunk(trace_json_path, trace, always_rebuild=True)
+            # else:
+            #     print("[Greenhouse] Bintrunk disabled by --no_bintrunk flag")
+            #     break
 
-            ## if no targets left and success not reached, attempt patch
-            ## generate bintrunk of target binary
-            trace_trunk_path, index = self.generate_bintrunk(trace_json_path, trace, always_rebuild=True)
-
-
-            if not binary is None:
-                binary.close()
-            binary = Binary(self.bin_path, trace.base_addr, count=count)
+            # if not binary is None:
+            #     binary.close()
+            # binary = Binary(self.bin_path, trace.base_addr, count=count)
 
             ## determine type of patch needed
             ## 1) patch out a wait loop
             ## 2) dodge an exit
             ## 3) patch out a crashing instruction/exit jump
             ## perform appropriate patch
-            if len(trace_trunk_path) <= 0 or \
-                not patcher.diagnose_and_patch(binary, self.bintrunk, trace, trace_trunk_path, index, exit_code, \
-                                              timedout, errored, is_daemonized, skip=self.diagnose_only, changelog=self.changelog):
-                if needs_nodaemon_patch:
-                    # revert
-                    print("    - unable to patch daemon call, reverting...")
-                    greenhouse_mode = True
-                    needs_nodaemon_patch = False
-                    count -= 1
-                    continue
-                else:
-                    # unable to patch
-                    print("No patch successful")
-                    self.changelog.append("[Greenhouse] No patch successful")
-                    if self.batchfolder_path:
-                        Files.rm_files([trace_path, trace_json_path])
-                    break
+            # if self.nopatch:
+            #     print("[Greenhouse] Patching and diagnosis disabled by --nopatch flag")
+            #     break
+            # elif self.no_bintrunk:
+            #     print("[Greenhouse] Bintrunk disabled, skipping patching")
+            #     break
+            # elif len(trace_trunk_path) <= 0 or \
+            #     not patcher.diagnose_and_patch(binary, self.bintrunk, trace, trace_trunk_path, index, exit_code, \
+            #                                   timedout, errored, is_daemonized, skip=self.diagnose_only, changelog=self.changelog):
+            #     if needs_nodaemon_patch:
+            #         # revert
+            #         print("    - unable to patch daemon call, reverting...")
+            #         greenhouse_mode = True
+            #         needs_nodaemon_patch = False
+            #         count -= 1
+            #         continue
+            #     else:
+            #         # unable to patch
+            #         print("No patch successful")
+            #         self.changelog.append("[Greenhouse] No patch successful")
+            #         if self.batchfolder_path:
+            #             Files.rm_files([trace_path, trace_json_path])
+                    # break
 
             ## rerun outer loop, including checking for new files and nvrams
             greenhouse_mode = True
@@ -969,11 +1096,11 @@ class Greenhouse():
             if self.repeat:
                 print("    - rerunning...")
                 continue
-            else:
-                if self.batchfolder_path:
-                    Files.rm_files([trace_path, trace_json_path])
-                print("    - cycle complete...")
-                return 0
+            # else:
+            #     if self.batchfolder_path:
+            #         Files.rm_files([trace_path, trace_json_path])
+            #     print("    - cycle complete...")
+            #     return 0
 
         print("[Greenhouse] Rehosting Complete, exiting...")
 
@@ -981,8 +1108,8 @@ class Greenhouse():
             rehost_result = "PARTIAL"
 
         self.write_changelog(self.changelog)
-        if self.batchfolder_path:
-            Files.rm_files([trace_path, trace_json_path])
+        # if self.batchfolder_path:
+        #     Files.rm_files([trace_path, trace_json_path])
         if self.output_dst_path and rehost_result != "FAILED":
             output_dir = self.name
             output_dir_path = os.path.join(self.output_dst_path, output_dir)
@@ -991,6 +1118,48 @@ class Greenhouse():
             print("."*50)
             self.runner.export_current_dockerfs(output_dir_path, result=rehost_result, name=output_dir, brand=self.brand, hash=self.sha256hash, \
                                                 checker=checker, external_qemu=self.external_qemu, urls=self.urls, time_to_up=time_to_up)
+            
+            # Save target_app_startup if it exists
+            if self.target_app_startup:
+                target_app_startup_path = os.path.join(output_dir_path, "target_app_startup.txt")
+                print(" - saving target_app_startup to: %s" % target_app_startup_path)
+                with open(target_app_startup_path, "w") as f:
+                    f.write(self.target_app_startup)
+                    
+            # Save target application logs if they exist
+            print(" - checking for target application logs...")
+            log_dir = os.path.join(output_dir_path, "target_logs")
+            Files.mkdir(log_dir)
+            
+            # Look for trace.log files in the filesystem
+            trace_log_files = []
+            try:
+                all_files = os.listdir(self.fs_path)
+                # Look for files containing "trace.log"
+                trace_log_files = [f for f in all_files if "trace.log" in f]
+                
+                # Also look for the specific target app log file format with any number
+                binary_name = os.path.basename(self.bin_path)
+                target_app_logs = [f for f in all_files if f.startswith(f"{binary_name}_trace.log")]
+                trace_log_files.extend(target_app_logs)
+                
+                # Remove duplicates
+                trace_log_files = list(set(trace_log_files))
+                
+                if trace_log_files:
+                    print(f" - found {len(trace_log_files)} trace.log files, copying to logs directory...")
+                    for log_file in trace_log_files:
+                        src_log_path = os.path.join(self.fs_path, log_file)
+                        dst_log_path = os.path.join(log_dir, log_file)
+                        if os.path.exists(src_log_path):
+                            print(f" - copying {log_file} to logs directory")
+                            shutil.copy2(src_log_path, dst_log_path)
+                else:
+                    print(" - no trace.log files found")
+                    
+            except Exception as e:
+                print(f" - error checking for logs: {str(e)}")
+            
             Files.rm_folder(self.workspace)
             Files.mkdir(self.workspace)
         else:
@@ -1010,10 +1179,17 @@ class Greenhouse():
             token_stats = self.runner.get_token_stats()
             self.total_input_tokens += token_stats['input_tokens']
             self.total_output_tokens += token_stats['output_tokens']
-            print("[TOKEN STATISTICS] Total Usage Across All Rounds:")
-            print(f"    - Total Input Tokens: {self.total_input_tokens}")
-            print(f"    - Total Output Tokens: {self.total_output_tokens}")
-            print(f"    - Total Tokens: {self.total_input_tokens + self.total_output_tokens}")
+        
+        # 统计 Fixer (NvramServer) 的 token 消耗
+        if hasattr(self, 'gh') and hasattr(self.gh, 'fixer') and self.gh.fixer:
+            fixer_token_stats = self.gh.fixer.get_token_stats()
+            self.total_input_tokens += fixer_token_stats['input_tokens']
+            self.total_output_tokens += fixer_token_stats['output_tokens']
+        
+        print("[TOKEN STATISTICS] Total Usage Across All Rounds:")
+        print(f"    - Total Input Tokens: {self.total_input_tokens}")
+        print(f"    - Total Output Tokens: {self.total_output_tokens}")
+        print(f"    - Total Tokens: {self.total_input_tokens + self.total_output_tokens}")
         
         print("="*50)
         if success and wellformed:
@@ -1037,12 +1213,28 @@ def main():
                     help='path to file containing a skiplist of filepaths to ignore')
     parser.add_argument('--brand', default="",
                     help='brand of target firmware. If not provided, will derive brand from the folder name of target')
+    
+    parser.add_argument('--api_key', default="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5",
+                    help='LLM api key')
+    parser.add_argument('--model', default="qwen3-max",
+                    help='LLM model')
 
     parser.add_argument('--target_bin', default="",
                     help='path to the target binary (manual override)')
     parser.add_argument('--bin_args', default="",
                     help='additional arguments to pass to the binary (manual override)')
-    parser.add_argument('--timeout', type=int, default=5,
+    
+    # Disable specific mechanisms
+    parser.add_argument('--no_extra_args', action="store_true", default=True,
+                    help='disable extra args mechanism - use only the provided bin_args')
+    parser.add_argument('--no_bg_scripts', action="store_true", default=False,
+                    help='disable background scripts mechanism')
+    parser.add_argument('--no_bintrunk', action="store_true", default=True,
+                    help='disable bintrunk related services to avoid errors when missing required information')
+    parser.add_argument('--nopatch', action="store_true", default=True,
+                        help='disable all patching and diagnosis.')
+    
+    parser.add_argument('--timeout', type=int, default=20,
                     help='num seconds to simulate the target binary in qemu before timeout (default 20mins)')
     parser.add_argument('--max_depth', type=int, default=-1,
                     help='maximum bintrunk context-sensitive cfg to construct')
@@ -1074,7 +1266,7 @@ def main():
                         help='diagnose only. Will suggest patches but not apply them.')
     parser.add_argument('-rh', '--rehost_first', action="store_true", default=False,
                         help='always attempt full rehosting using FirmAE first before patch loop.')
-    parser.add_argument('-pc', '--partial_configs', action="store_true", default=False,
+    parser.add_argument('-pc', '--partial_configs', action="store_true", default=True,
                         help='just run until a wellformed webpage, do not further iterate for better nvram/configs')
     
     # flags to disable stuff
@@ -1084,8 +1276,8 @@ def main():
                         help='run patch loop until success or no patch possible. Otherwise, patch loop only runs once')
     parser.add_argument('-ns', '--nostrict', action="store_true", default=False,
                         help='strict patching - keep trying until HTTP return code is 200 and well-formed')
-    parser.add_argument('-nd', '--nodedaemon', action="store_true", default=False,
-                        help='try to find and run nodaemon flags')
+    parser.add_argument('-nd', '--nodedaemon', action="store_true", default=True,
+                        help='disable dedaemoning attempts after a successful rehost is done')
     parser.add_argument('-nb', '--nohack_bind', action="store_true", default=False,
                         help='disables hack bind')
     parser.add_argument('-np', '--nohack_devproc', action="store_true", default=False,

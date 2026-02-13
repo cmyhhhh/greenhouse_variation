@@ -336,7 +336,7 @@ class HTTPInteractionCheck:
                 ip_port_url_type_user_pass_headers_payload = (uc.ip, uc.port, uc.loginurl, uc.login_type, uc.user, uc.password, uc.headers, uc.data)
         return ip_port_url_type_user_pass_headers_payload
 
-    def check(self, trace, exit_code, timedout, errored, strict):
+    def check(self, exit_code, timedout, errored, strict):
         connected = False
         if not errored:
             if self.urlchecks:

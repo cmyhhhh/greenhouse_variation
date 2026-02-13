@@ -53,6 +53,7 @@ ARCH_MAP = {"arm": "qemu-arm-static",
 RESERVED_IPS = ["0.0.0.0", "127.0.0.1", "1.1.1.1", "1.0.0.1"]
 PORTS_BLACKLIST = ['0', '22']
 MAC_NVRAM_KEYS = ["lan_hwaddr"]
+POTENTIAL_INIT = ["rcs", "rc", "profile"]
 
 class Fixer():
     def __init__(self, qemu_src_path, gh_path, scripts_path, brand, baseline_mode):
@@ -75,6 +76,9 @@ class Fixer():
         self.found_funcs = []
         self.binary_path = None
         self.fs_path = None
+        
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     def set_found_funcs(self, found_funcs):
         """
@@ -121,6 +125,62 @@ class Fixer():
         Files.copy_file(iproutePath, iprouteDest)
         Files.copy_file(busyboxPath, busyboxDest)
         Files.touch_file(os.path.join(fs_path, "GREENHOUSE_WEB_CANARY"), root=fs_path) # create index page 'canary'
+
+        # Check if gh_nvram folder exists and copy to fs_path
+        gh_nvram_source = os.path.join(self.gh_path, "gh_nvram")
+        if os.path.exists(gh_nvram_source) and os.path.isdir(gh_nvram_source):
+            gh_nvram_dest = os.path.join(fs_path, NVRAM_KEY_VALUE_FOLDER)
+            print(f"    - Found gh_nvram folder, copying from {gh_nvram_source} to {gh_nvram_dest}")
+            # If destination exists, remove it first to avoid errors
+            if os.path.exists(gh_nvram_dest):
+                import shutil
+                shutil.rmtree(gh_nvram_dest)
+            Files.copy_directory(gh_nvram_source, gh_nvram_dest)
+
+        # Check if filtered_init_scripts folder exists and handle filtered_init_scripts.txt
+        init_scripts_path = os.path.join(self.gh_path, "init_files")
+        if os.path.exists(init_scripts_path) and os.path.isdir(init_scripts_path):
+            filtered_scripts_file = os.path.join(init_scripts_path, "filtered_init_scripts.txt")
+            if os.path.exists(filtered_scripts_file):
+                print(f"    - Found init_files folder with filtered_init_scripts.txt")
+                with open(filtered_scripts_file, 'r') as f:
+                    scripts = [line.strip() for line in f if line.strip()]
+                for script_path in scripts:
+                    # 去掉开头的 /，防止 join 时产生绝对路径
+                    if script_path.startswith('/'):
+                        script_path = script_path[1:]
+                    # Source path in self.gh_path/init_scripts
+                    source = os.path.join(init_scripts_path, script_path)
+                    # Destination path in fs_path
+                    dest = os.path.join(fs_path, script_path)
+                    # Check if source exists
+                    if os.path.exists(source):
+                        # Create destination directory if it doesn't exist
+                        dest_dir = os.path.dirname(dest)
+                        if not os.path.exists(dest_dir):
+                            print(f"    - Creating directory {dest_dir}")
+                            Files.mkdir(dest_dir, root=fs_path, silent=True)
+                        # Copy source to destination
+                        print(f"    - Copying {source} to {dest}")
+                    else:
+                        print(f"    - Source {source} does not exist, skipping")
+            
+            # Copy banned_cmds.txt if it exists
+            banned_cmds_file = os.path.join(init_scripts_path, "banned_cmds.txt")
+            if os.path.exists(banned_cmds_file):
+                dst_file = os.path.join(fs_path, "banned_cmds.txt")
+                print(f"    - Copying banned_cmds.txt to {dst_file}")
+                Files.copy_file(banned_cmds_file, dst_file)
+            
+            # Copy gh_nvram directory if it exists
+            gh_nvram_dir = os.path.join(init_scripts_path, "gh_nvram")
+            if os.path.exists(gh_nvram_dir) and os.path.isdir(gh_nvram_dir):
+                dst_dir = os.path.join(fs_path, "gh_nvram")
+                print(f"    - Copying gh_nvram directory to {dst_dir}")
+                # If destination exists, remove it first
+                if os.path.exists(dst_dir):
+                    shutil.rmtree(dst_dir)
+                Files.copy_directory(gh_nvram_dir, dst_dir)
 
         #chmod +x
         sp = subprocess.run(["chmod", "+x", self.qemu_run_path])
@@ -546,6 +606,22 @@ class Fixer():
             for key in keylog:
                 nvramFile.write(key+"\n")
         nvramFile.close()
+        
+        # 统计 NvramServer 的 token 消耗
+        if self.nvram_server:
+            self.total_input_tokens += self.nvram_server.get_total_input_tokens()
+            self.total_output_tokens += self.nvram_server.get_total_output_tokens()
+            print(f"NvramServer Token Usage - Input: {self.nvram_server.get_total_input_tokens()}, Output: {self.nvram_server.get_total_output_tokens()}")
+
+    def get_token_stats(self):
+        """
+        获取token统计信息
+        """
+        return {
+            'input_tokens': self.total_input_tokens,
+            'output_tokens': self.total_output_tokens,
+            'total_tokens': self.total_input_tokens + self.total_output_tokens
+        }
 
     def check_ip(self, ip):
         if len(ip) > 0:
@@ -662,8 +738,42 @@ class Planter():
             print("    - ", stdout)
             found_fs = self.identify_target_folder(extracted_path)
             if found_fs:
-                fs_path = found_fs #os.path.join(root, d)
-                print("Found root dir at %s" % found_fs)
+                # Process each directory level to handle multiple levels with special characters
+                current_path = ""
+                components = found_fs.split(os.sep)
+                
+                for i, component in enumerate(components):
+                    # Handle absolute paths (first component is empty for paths starting with /)
+                    if i == 0 and not component:
+                        current_path = os.sep
+                        continue
+                    
+                    # Skip other empty components
+                    if not component:
+                        continue
+                    
+                    # Process the component
+                    new_component = re.sub(r'[\(\)\-]', '_', component)
+                    
+                    # Build the next path segment
+                    if current_path:
+                        next_path = os.path.join(current_path, new_component)
+                        old_next_path = os.path.join(current_path, component)
+                    else:
+                        # First non-empty component (relative path)
+                        next_path = new_component
+                        old_next_path = component
+                    
+                    # Rename if needed
+                    if new_component != component and os.path.exists(old_next_path):
+                        print(f"Renaming directory from {old_next_path} to {next_path}")
+                        os.rename(old_next_path, next_path)
+                    
+                    # Update current path
+                    current_path = next_path
+                
+                fs_path = current_path
+                print("Found root dir at %s" % fs_path)
                 return fs_path
 
         else:
@@ -701,6 +811,80 @@ class Planter():
                 return True
         return False    
 
+    def get_target_binary_and_init(self, fs_path, rehost_type):
+        potential_binaries = self.get_potential_binaries(rehost_type)
+        potential_init = POTENTIAL_INIT
+        pot_targets = dict()
+        pot_init = dict()
+        bin_path_final = ""
+        init_path_final = ""
+        for root, dirs, files in os.walk(fs_path, topdown=False):
+            for name in files:
+                if name.lower() in potential_init:
+                    if name.lower() not in pot_init.keys():
+                        pot_init[name.lower()] = []
+                    pot_init[name.lower()].append(os.path.join(root, name))
+                if name.lower() in potential_binaries:
+                    if name.lower() not in pot_targets.keys():
+                        pot_targets[name.lower()] = []
+                    pot_targets[name.lower()].append(os.path.join(root, name))
+
+        print("Potential Binaries: " + str(pot_targets))
+        print("Potential Init: " + str(pot_init))
+        # return "best" match in order listed in potential_binaries
+        for binary in potential_binaries:
+            if binary in pot_targets.keys():
+                for bin_path in pot_targets[binary]:
+                    sp = subprocess.run(
+                        ["file", bin_path], stdout=PIPE, stderr=PIPE)
+                    stdout = sp.stdout
+                    details = stdout.split(b":")[1].strip()
+                    if details.startswith(b"ELF "):
+                        print("    - Found binary: %s" % bin_path)
+                        bin_path_final = bin_path
+                        break
+                else:
+                    continue
+                break
+
+        # 先判断是否全匹配，再看当前的init脚本路径是否在其他候选init脚本里，若没有则直接确定
+        for init in potential_init:
+            if init in pot_init.keys():
+                candidates = pot_init[init]
+                # 只有一个全匹配，直接确定
+                if len(candidates) == 1:
+                    init_path_final = candidates[0]
+                    print("    - Found init: %s" % init_path_final)
+                    break
+                # 多个全匹配，检查当前init路径是否出现在其他候选init脚本中
+                for init_path in candidates:
+                    appears_in_others = False
+                    # 转换成rehosting环境中的路径
+                    init_path_rel = init_path.replace(fs_path, "")
+                    # 遍历其他所有候选init脚本
+                    for other_init, other_paths in pot_init.items():
+                        if other_init == init:
+                            continue
+                        for other_path in other_paths:
+                            try:
+                                with open(other_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    if init_path_rel in f.read():
+                                        appears_in_others = True
+                                        break
+                            except:
+                                continue
+                        if appears_in_others:
+                            break
+                    if not appears_in_others:
+                        init_path_final = init_path
+                        print("    - Found init: %s" % init_path_final)
+                        break
+                else:
+                    continue
+                break
+
+        return [bin_path_final, init_path_final]
+    
     def get_target_binary(self, fs_path, rehost_type):
         potential_binaries = self.get_potential_binaries(rehost_type)
         pot_targets = dict()
