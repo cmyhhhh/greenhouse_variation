@@ -741,18 +741,18 @@ class QemuRunner:
                     print(f"Target app startup command already exists: {inferred_startup_cmd}")
                 else:
                     print("Starting to infer target app startup command...")
-                # 使用StartupCommandServer进行推理
-                startup_server = StartupCommandServer(self.fs_path, self.bin_path, self.qemu_arch, tempCont.name, self.api_key, self.model)
-                inferred_startup_cmd = startup_server.get_target_app_startup(ps_target_app_startup)
-                
-                # 统计 StartupCommandServer 的 token 消耗
-                self.total_input_tokens += startup_server.get_total_input_tokens()
-                self.total_output_tokens += startup_server.get_total_output_tokens()
-                print(f"StartupCommandServer Token Usage - Input: {startup_server.get_total_input_tokens()}, Output: {startup_server.get_total_output_tokens()}")
+                    # 使用StartupCommandServer进行推理
+                    startup_server = StartupCommandServer(self.fs_path, self.bin_path, self.qemu_arch, tempCont.name, self.api_key, self.model)
+                    inferred_startup_cmd = startup_server.get_target_app_startup(ps_target_app_startup)
                     
-                if not inferred_startup_cmd:
-                    print("Inference did not get a valid target app startup command, skipping...")
-                    return
+                    # 统计 StartupCommandServer 的 token 消耗
+                    self.total_input_tokens += startup_server.get_total_input_tokens()
+                    self.total_output_tokens += startup_server.get_total_output_tokens()
+                    print(f"StartupCommandServer Token Usage - Input: {startup_server.get_total_input_tokens()}, Output: {startup_server.get_total_output_tokens()}")
+                        
+                    if not inferred_startup_cmd:
+                        print("Inference did not get a valid target app startup command, skipping...")
+                        return
             
                     print(f"Inferred target app startup command: {inferred_startup_cmd}")
                 # Reference command_script_path method, build script and execute
