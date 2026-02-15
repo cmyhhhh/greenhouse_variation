@@ -200,7 +200,7 @@ class TraceParser():
         print("TraceParser parsing", strace_path)
         if (".tar" not in strace_path):
             print("    - ERROR trace dump should be a tar archive!")
-            return
+            return targets, folders, nvrams, ip_addrs, ipv6_addrs, target_ports, interfaces, failed, segfaulted, is_daemonized
         # time.sleep(1)
         with tarfile.open(strace_path) as tFile:
             members = tFile.getmembers()
