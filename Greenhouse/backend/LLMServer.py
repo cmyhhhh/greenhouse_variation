@@ -1287,6 +1287,12 @@ class StartupCommandServer:
             base_url="https://api.vectorengine.ai/v1",
         )
     
+    def get_total_input_tokens(self):
+        return self.total_input_token
+    
+    def get_total_output_tokens(self):
+        return self.total_output_token
+    
     def copy_logs_from_container(self):
         """
         将容器中的日志文件复制到宿主机的self.fs_path目录
@@ -2279,7 +2285,7 @@ class ContainerPsMonitor:
                 for cmd in self.cmd_leaf_counts.keys():
                     if cmd not in [p['cmd'] for p in leaf_processes] and self.cmd_leaf_counts[cmd] > 0:
                         self.cmd_leaf_counts[cmd] = self.cmd_leaf_counts[cmd] - 1 
-                        print(f"[ContainerPsMonitor] Command '{cmd}' count -1")
+                        # print(f"[ContainerPsMonitor] Command '{cmd}' count -1")
             
         except Exception as e:
             print(f"[ContainerPsMonitor] Error updating process info: {e}")
@@ -2385,7 +2391,7 @@ class InitServer:
 
     def __init__(self, container_fs_path, container_name, fs_path,
                  api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="deepseek-v3.2",
-                 target_application="HTTP Server", host_accesscontrold="10.201.169.58", port_accesscontrold=9999):
+                 target_application="HTTP Server", host_accesscontrold="192.168.0.5", port_accesscontrold=9999):
         self.container_fs_path = container_fs_path
         self.container_name = container_name
         self.fs_path = fs_path
