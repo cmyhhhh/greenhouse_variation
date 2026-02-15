@@ -463,6 +463,8 @@ class QemuRunner:
 
         qemu_command = ["chroot", DOCKER_FS, "/"+self.qemu_arch]
         qemu_command.extend(["-pconly"])
+        # TODO: 加个控制llm的参数
+        qemu_command.extend(["-llm"])
         if self.hackbind and not self.baseline_mode:
             qemu_command.extend(["-hackbind"])
         if self.hackdevproc and not self.baseline_mode:
@@ -478,6 +480,7 @@ class QemuRunner:
         
         # -execve部分参数
         qemu_command.extend(["-execve", "\"/"+self.qemu_arch+" -pconly"])
+        qemu_command.extend(["-llm"])
         if self.hackbind and not self.baseline_mode:
             qemu_command.extend(["-hackbind"])
         if self.hackdevproc and not self.baseline_mode:
@@ -707,7 +710,7 @@ class QemuRunner:
             tempCont.start()
             
             import threading
-            self.init_server = InitServer(container_fs_path="/"+DOCKER_FS, container_name=tempCont.name, fs_path=self.fs_path, model="qwen3-max")
+            self.init_server = InitServer(container_fs_path="/"+DOCKER_FS, container_name=tempCont.name, fs_path=self.fs_path, model="deepseek-v3.2")
             self.init_thread = threading.Thread(target=self.init_server.run, args=(0.1,), daemon=True)
             self.init_thread.start()
             
@@ -742,7 +745,7 @@ class QemuRunner:
                 else:
                     print("Starting to infer target app startup command...")
                     # 使用StartupCommandServer进行推理
-                    startup_server = StartupCommandServer(self.fs_path, self.bin_path, self.qemu_arch, tempCont.name, self.api_key, self.model)
+                    startup_server = StartupCommandServer(self.fs_path, self.bin_path, self.qemu_arch, tempCont.name, self.api_key)
                     inferred_startup_cmd = startup_server.get_target_app_startup(ps_target_app_startup)
                     
                     # 统计 StartupCommandServer 的 token 消耗
@@ -800,7 +803,7 @@ class QemuRunner:
             NO_TARGET_THRESHOLD = 20 # 无目标应用日志最大检测次数
             # MAX_TAIL = 10000000
             TAIL_SIZE = 10000000
-            MAX_TRACES = 200
+            MAX_TRACES = 50
             print("Checking for program end")
 
             backtrace = []
