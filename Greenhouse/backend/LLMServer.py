@@ -637,7 +637,11 @@ Debug mode is disabled; skip checks that might block firmware continuation
                                         break
                             # 如果找到函数定义行，则把该行及之前的变量数据信息也加入提示
                             if func_line > 0:
-                                header_lines = lines[:func_line]
+                                # 检查header_lines长度是否超过1000行
+                                if func_line <= 1000:
+                                    header_lines = lines[:func_line]
+                                else:
+                                    header_lines = []
                             start_line = max(1, line_num - 50)
                             end_line = min(total_lines, line_num + 49)
                             key_snippet_lines = lines[start_line - 1:end_line]
