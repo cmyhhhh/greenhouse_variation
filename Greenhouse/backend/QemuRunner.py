@@ -833,7 +833,12 @@ class QemuRunner:
                 
                 if out and "No such file" not in out:
                     # 获取所有匹配的日志文件列表
-                    target_log_files = sorted(out.split())
+                    # 根据文件名最后的数字进行排序
+                    def get_log_number(filename):
+                        import re
+                        match = re.search(r'log(\d+)$', filename)
+                        return int(match.group(1)) if match else 0
+                    target_log_files = sorted(out.split(), key=get_log_number)
                 else:
                     target_log_files = []
                     noTargetCount += 1
