@@ -761,7 +761,8 @@ class Greenhouse():
             # segfaulted: 如果emulation_dump中包含"SIGSEGV"，则为True，表示程序发生了段错误
             # is_daemonized: 如果程序调用了fork并退出，则为True，表示程序以守护进程方式运行
             # 判断 self.fs_path 文件夹下是否存在目标应用日志
-            targets, folders, configs, ip_addrs, ipv6_addrs, ports, interfaces, failed, segfaulted, is_daemonized = set(), set(), set(), set(), set(), set(), set(), set(), False, False
+            targets, folders, configs, ip_addrs, ipv6_addrs, ports, interfaces, failed, segfaulted, is_daemonized = sparser.parse(
+                                emulation_output, "", forkmap=forkmap)
             binary_name = os.path.basename(self.bin_path)
             log_prefix = f"{binary_name}_trace.log"
             trace_path_full = os.path.join(self.fs_path, f"{log_prefix}1.tar")

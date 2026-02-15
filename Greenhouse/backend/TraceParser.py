@@ -153,6 +153,49 @@ class TraceParser():
         segfaulted = False
         forked = False
         pid = -1
+        
+        targets = set()
+        nvrams =  set()
+        ip_addrs =  set()
+        ipv6_addrs = set()
+        target_ports =  set()
+        interfaces =  set()
+        # target = ports = []
+        for line in emulation_dump.split("\n"):
+            if "=Unknown" in line:
+                if "22;31m" in line:
+                    line = line.split("22;31m")[1]
+                groups = self.error_re.match(line)
+                if groups != None:
+                    config = groups.group('nvram')
+                    config = config.strip()
+                    if config not in nvrams:
+                        nvrams.add(config)
+                else:
+                    print("Error processing line ", line)
+            if "[GreenHouseQEMU]" in line:
+                if "IP:" in line:
+                    fields = line.split(":")
+                    ip = fields[1].strip()
+                    if ip not in ip_addrs and self.check_ip(ip):
+                        ip_addrs.add(ip)
+                if "IPV6:" in line:
+                    fields = line.split(":")
+                    ip = fields[1].strip()
+                    if ip not in ipv6_addrs:
+                        ipv6_addrs.add(ip)
+                if "PORT:" in line:
+                    fields = line.split(":")
+                    port = fields[1].strip()
+                    if port not in target_ports:
+                        target_ports.add(port)
+                if "BIND_DEVICE:" in line:
+                    fields = line.split(":")
+                    device = fields[1].strip()
+                    if device not in interfaces:
+                        interfaces.add(device)
+                if "SIGSEGV" in line:
+                    segfaulted = True
 
         print("TraceParser parsing", strace_path)
         if (".tar" not in strace_path):
@@ -259,48 +302,6 @@ class TraceParser():
         tFile.close()
 
         print("    - [pid:%s] parse completed!" % pid)
-        targets = set()
-        nvrams =  set()
-        ip_addrs =  set()
-        ipv6_addrs = set()
-        target_ports =  set()
-        interfaces =  set()
-        # target = ports = []
-        for line in emulation_dump.split("\n"):
-            if "=Unknown" in line:
-                if "22;31m" in line:
-                    line = line.split("22;31m")[1]
-                groups = self.error_re.match(line)
-                if groups != None:
-                    config = groups.group('nvram')
-                    config = config.strip()
-                    if config not in nvrams:
-                        nvrams.add(config)
-                else:
-                    print("Error processing line ", line)
-            if "[GreenHouseQEMU]" in line:
-                if "IP:" in line:
-                    fields = line.split(":")
-                    ip = fields[1].strip()
-                    if ip not in ip_addrs and self.check_ip(ip):
-                        ip_addrs.add(ip)
-                if "IPV6:" in line:
-                    fields = line.split(":")
-                    ip = fields[1].strip()
-                    if ip not in ipv6_addrs:
-                        ipv6_addrs.add(ip)
-                if "PORT:" in line:
-                    fields = line.split(":")
-                    port = fields[1].strip()
-                    if port not in target_ports:
-                        target_ports.add(port)
-                if "BIND_DEVICE:" in line:
-                    fields = line.split(":")
-                    device = fields[1].strip()
-                    if device not in interfaces:
-                        interfaces.add(device)
-                if "SIGSEGV" in line:
-                    segfaulted = True
         
         # check for nvrams inside log file
         nvramLogPath = os.path.join(self.fs_path, NVRAM_LOG_PATH)
