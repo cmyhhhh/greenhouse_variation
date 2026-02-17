@@ -1728,24 +1728,45 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
             for file_path in potential_files:
                 actual_path = None
                 
-                # 在容器中检查是否为文件（不是文件夹）
-                check_cmd = f"if [ -f {file_path} ]; then echo 'FILE_EXISTS'; elif [ -d {file_path} ]; then echo 'DIRECTORY_EXISTS'; else echo 'NOT_EXIST'; fi"
-                result = container.exec_run(
-                    ["/bin/sh", "-c", check_cmd],
-                    stream=False,
-                    detach=False,
-                    tty=True
-                )
-                
-                output = result.output.decode('utf-8', errors='ignore').strip()
-                
-                # 如果是文件，使用该路径
-                if output == 'FILE_EXISTS':
-                    actual_path = file_path
-                elif output != 'DIRECTORY_EXISTS':  # 不是文件夹，尝试搜索
-                    # 如果不存在，尝试在容器的根目录下搜索同名文件
-                    filename = file_path.split('/')[-1]
-                    search_cmd = f"find /fs/ -name '{filename}' -type f 2>/dev/null | head -1"
+                # 先判断路径是否带有 /
+                if '/' in file_path:
+                    # 带/表明是路径文件，先检查是否存在该文件
+                    # 在/fs路径下检查
+                    # 确保路径拼接正确，处理相对路径和绝对路径
+                    if file_path.startswith('/'):
+                        full_path = f"/fs{file_path}"
+                    else:
+                        full_path = f"/fs/{file_path}"
+                    check_cmd = f"if [ -f {full_path} ]; then echo 'FILE_EXISTS'; else echo 'NOT_EXIST'; fi"
+                    result = container.exec_run(
+                        ["/bin/sh", "-c", check_cmd],
+                        stream=False,
+                        detach=False,
+                        tty=True
+                    )
+                    
+                    output = result.output.decode('utf-8', errors='ignore').strip()
+                    
+                    if output == 'FILE_EXISTS':
+                        actual_path = full_path
+                    else:
+                        # 如果查找不到，使用find去查找basename
+                        filename = file_path.split('/')[-1]
+                        search_cmd = f"find /fs/ -name '{filename}' -type f 2>/dev/null | head -1"
+                        search_result = container.exec_run(
+                            ["/bin/sh", "-c", search_cmd],
+                            stream=False,
+                            detach=False,
+                            tty=True
+                        )
+                        
+                        search_output = search_result.output.decode('utf-8', errors='ignore').strip()
+                        
+                        if search_output:
+                            actual_path = search_output
+                else:
+                    # 不带/，直接使用find查找文件
+                    search_cmd = f"find /fs/ -name '{file_path}' -type f 2>/dev/null | head -1"
                     search_result = container.exec_run(
                         ["/bin/sh", "-c", search_cmd],
                         stream=False,
@@ -1758,24 +1779,54 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
                     if search_output:
                         actual_path = search_output
                 
+                # 标记是否为文件夹
+                is_directory = False
+                
+                # 如果都没找到文件，判断是不是文件夹
+                if not actual_path:
+                    # 检查是否为文件夹
+                    if '/' in file_path:
+                        # 带/的路径，检查是否为文件夹
+                        # 确保路径拼接正确，处理相对路径和绝对路径
+                        if file_path.startswith('/'):
+                            full_path = f"/fs{file_path}"
+                        else:
+                            full_path = f"/fs/{file_path}"
+                        dir_check_cmd = f"if [ -d {full_path} ]; then echo 'DIRECTORY_EXISTS'; else echo 'NOT_EXIST'; fi"
+                    else:
+                        # 不带/的路径，尝试在/fs下查找同名文件夹
+                        dir_check_cmd = f"find /fs/ -name '{file_path}' -type d 2>/dev/null | head -1"
+                    
+                    dir_result = container.exec_run(
+                        ["/bin/sh", "-c", dir_check_cmd],
+                        stream=False,
+                        detach=False,
+                        tty=True
+                    )
+                    
+                    dir_output = dir_result.output.decode('utf-8', errors='ignore').strip()
+                    
+                    # 如果找到文件夹，标记为文件夹
+                    if dir_output and (dir_output == 'DIRECTORY_EXISTS' or '/' in dir_output):
+                        is_directory = True
+                
                 if actual_path:
                     # 记录文件映射关系
                     file_mapping[file_path] = actual_path
                     # 替换命令中的文件路径
-                    updated_command = updated_command.replace(file_path, actual_path)
-                else:
-                    # 如果仍然没有找到，则添加到缺失文件列表
+                    # 在chroot fs环境下执行，需要移除/fs前缀
+                    chroot_path = actual_path.replace('/fs', '', 1)
+                    updated_command = updated_command.replace(file_path, chroot_path)
+                elif not is_directory:
+                    # 如果不是文件夹且仍然没有找到文件，则添加到缺失文件列表
                     missing_files.append(file_path)
                     
         except docker.errors.NotFound:
             print(f"[StartupCommandServer] Container '{self.container_name}' does not exist, please check the container name is correct")
-            missing_files = potential_files
         except docker.errors.APIError as e:
             print(f"[StartupCommandServer] Docker API call failed: {e}")
-            missing_files = potential_files
         except Exception as e:
             print(f"[StartupCommandServer] Unknown error occurred when checking file existence: {e}")
-            missing_files = potential_files
         
         return missing_files, file_mapping, updated_command
     
