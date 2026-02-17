@@ -53,7 +53,7 @@ ARCH_MAP = {"arm": "qemu-arm-static",
 RESERVED_IPS = ["0.0.0.0", "127.0.0.1", "1.1.1.1", "1.0.0.1"]
 PORTS_BLACKLIST = ['0', '22']
 MAC_NVRAM_KEYS = ["lan_hwaddr"]
-POTENTIAL_INIT = ["rcs", "rc", "profile"]
+POTENTIAL_INIT = ["preinitmt", "preinit","rcs", "rc", "profile"]
 
 class Fixer():
     def __init__(self, qemu_src_path, gh_path, scripts_path, brand, baseline_mode):
@@ -752,8 +752,8 @@ class Planter():
                     if not component:
                         continue
                     
-                    # Process the component
-                    new_component = re.sub(r'[\(\)\-]', '_', component)
+                    # Process the component - replace spaces and special characters with underscores
+                    new_component = re.sub(r'[\(\)\-\s]', '_', component)
                     
                     # Build the next path segment
                     if current_path:
@@ -766,7 +766,7 @@ class Planter():
                     
                     # Rename if needed
                     if new_component != component and os.path.exists(old_next_path):
-                        print(f"Renaming directory from {old_next_path} to {next_path}")
+                        print(f"Renaming directory from '{old_next_path}' to '{next_path}'")
                         os.rename(old_next_path, next_path)
                     
                     # Update current path
