@@ -2661,7 +2661,7 @@ brctl addbr br0
         加载AST JSON文件
         """
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return json.load(f)
         except json.JSONDecodeError as e:
             print(f"[InitServer] [✖] JSON parsing failed for {path}: {e}")
@@ -2729,11 +2729,20 @@ brctl addbr br0
         
         # 如果 AST 文件已存在则跳过 shfmt
         if not os.path.exists(parser_ast_path):
-            # 使用真实文件路径执行 shfmt 命令
-            shell_to_ast_cmd = f"shfmt --to-json < {real_init_script_path} > {parser_ast_path}"
-            # print(f"[InitServer] Running: {shell_to_ast_cmd}")
-            
+            # 预处理文件，处理编码问题
             try:
+                # 读取文件并忽略编码错误
+                with open(real_init_script_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                # 临时文件路径
+                temp_file_path = f"/tmp/{base_name}_temp.sh"
+                # 写入临时文件
+                with open(temp_file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                # 使用临时文件执行 shfmt 命令
+                shell_to_ast_cmd = f"shfmt --to-json < {temp_file_path} > {parser_ast_path}"
+                # print(f"[InitServer] Running: {shell_to_ast_cmd}")
+                
                 result = subprocess.run(shell_to_ast_cmd, shell=True, check=True, text=True, capture_output=True)
                 # Check if the generated file is empty
                 if os.path.exists(parser_ast_path):
@@ -2938,135 +2947,148 @@ brctl addbr br0
         """
         过滤init脚本
         """
-        real_init_script_path = os.path.join(self.fs_path, self.init_script_path.lstrip("/"))
-        with open(real_init_script_path, 'r') as f:
-            init_script = f.read()
-        
-        prompt = [
-            {"role": "system", "content": self.system_content},
-            {"role": "user", "content": init_script}
-        ]
-        
-        response_content = ""
-        num_try = 0
-        
-        while num_try <= self.try_max_num:
-            num_try += 1
-            
-            # print(f"[InitServer] Calling Qwen API for the {num_try}th time")
-            
-            start_time = time.time()
-            
-            # 增加LLM请求计数
-            with self.llm_request_lock:
-                self.llm_request_count += 1
-                # 创建锁文件，使用时间戳防止重复
-                timestamp = int(time.time() * 1000)  # 毫秒级时间戳
-                lock_file = f"{LLM_LOCK_PREFIX}{timestamp}"
-                # print(f"[InitServer] Creating lock file: {lock_file}")
-                open(lock_file, 'w').close()
-            
-            try:
-                # 使用OpenAI客户端调用LLM
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=prompt,
-                    temperature=1,
-                    top_p=0.5,
-                )
-                
-                end_time = time.time()
-                llm_time = end_time - start_time
-                
-                # 记录token使用情况
-                self.total_input_token += response.usage.prompt_tokens
-                self.total_output_token += response.usage.completion_tokens
-                print(f"[InitServer] Input tokens for attempt {num_try}: {response.usage.prompt_tokens}")
-                print(f"[InitServer] Output tokens for attempt {num_try}: {response.usage.completion_tokens}")
-                print(f"[InitServer] LLM API call time for attempt {num_try}: {llm_time:.2f} seconds")
-                
-                # 获取回复内容
-                response_content = response.choices[0].message.content
-                # print("=" * 20 + "Complete Response" + "=" * 20)
-                # print(response_content)
-                break
-            except AuthenticationError as e:
-                print(f"[InitServer] Authentication error: {e}")
-                print(f"[InitServer] Please check your API key.")
-                response_content = ""  # 清空回复内容，触发后续的失败处理
-                break  # 认证错误，直接跳出循环，不重试
-            except BadRequestError as e:
-                print(f"[InitServer] Bad request error: {e}")
-                print(f"[InitServer] Please check your request parameters.")
-                response_content = ""  # 清空回复内容，触发后续的失败处理
-                break  # 请求参数错误，直接跳出循环，不重试
-            except RateLimitError as e:
-                print(f"[InitServer] Rate limit error: {e}")
-                print(f"[InitServer] Too many requests, waiting before retry...")
-                response_content = ""  # 清空回复内容，以便进行下一次尝试
-                time.sleep(2)  # 速率限制，等待2秒后重试
-            except APIConnectionError as e:
-                print(f"[InitServer] Connection error: {e}")
-                print(f"[InitServer] Network issue, retrying...")
-                response_content = ""  # 清空回复内容，以便进行下一次尝试
-                time.sleep(1)  # 连接错误，等待1秒后重试
-            except APIError as e:
-                print(f"[InitServer] API error: {e}")
-                print(f"[InitServer] Server error, retrying...")
-                response_content = ""  # 清空回复内容，以便进行下一次尝试
-                time.sleep(1)  # API错误，等待1秒后重试
-            except Exception as e:
-                print(f"[InitServer] Unexpected error: {e}")
-                print(f"[InitServer] Unknown error, retrying...")
-                response_content = ""  # 清空回复内容，以便进行下一次尝试
-                time.sleep(1)  # 未知错误，等待1秒后重试
-            finally:
-                # 减少LLM请求计数
-                with self.llm_request_lock:
-                    self.llm_request_count -= 1
-                    # 删除锁文件
-                    os.remove(lock_file)
-        
-        if not response_content:
-            print("[InitServer] [!] All attempts failed, unable to get LLM response")
-            return
-        
-        # 移除Markdown注释
-        response_content = self.remove_markdown_comments(response_content)
-        
-        # # 备份原文件并写入新内容
-        # self.rename_file(real_init_script_path)
-        # 删除原文件并写入新内容
-        if os.path.exists(real_init_script_path):
-            os.remove(real_init_script_path)
-            # print(f"[InitServer] Deleted original init script: {real_init_script_path}")
-        
-        # print(f"[InitServer] Writing new init script to {real_init_script_path}")
-        with open(real_init_script_path, 'w') as f:
-            f.write(response_content)
-        
-        # 复制过滤后的脚本到容器中
         try:
-            tar_stream = io.BytesIO()
-            with tarfile.open(fileobj=tar_stream, mode='w') as tar:
-                tar.add(real_init_script_path, arcname=os.path.basename(self.init_script_path))
-            tar_stream.seek(0)
-            docker_path = os.path.join(self.container_fs_path, os.path.dirname(self.init_script_path))
-            # 复制到容器中的对应路径
-            self.container.put_archive(path=docker_path, data=tar_stream.read())
-            # print(f"[InitServer] Successfully copied filtered init script to container")
-        except Exception as e:
-            print(f"[InitServer] Failed to copy filtered init script to container: {e}")
+            real_init_script_path = os.path.join(self.fs_path, self.init_script_path.lstrip("/"))
+            # 使用errors='ignore'选项读取文件，忽略编码错误
+            with open(real_init_script_path, 'r', encoding='utf-8', errors='ignore') as f:
+                init_script = f.read()
             
-        # 解析新脚本
-        # print("[InitServer] Parsing LLM-generated init script")
-        self.parse_init_script()
-        
-        # 比较原始脚本和新脚本
-        removed_commands, retained_commands = self.compare_original_and_new_commands()
-        
-        # 更新白名单和黑名单
-        self.update_whitelist_and_blacklist(removed_commands, retained_commands)
+            prompt = [
+                {"role": "system", "content": self.system_content},
+                {"role": "user", "content": init_script}
+            ]
+            
+            response_content = ""
+            num_try = 0
+            
+            while num_try <= self.try_max_num:
+                num_try += 1
+                
+                # print(f"[InitServer] Calling Qwen API for the {num_try}th time")
+                
+                start_time = time.time()
+                
+                # 增加LLM请求计数
+                with self.llm_request_lock:
+                    self.llm_request_count += 1
+                    # 创建锁文件，使用时间戳防止重复
+                    timestamp = int(time.time() * 1000)  # 毫秒级时间戳
+                    lock_file = f"{LLM_LOCK_PREFIX}{timestamp}"
+                    # print(f"[InitServer] Creating lock file: {lock_file}")
+                    open(lock_file, 'w').close()
+                
+                try:
+                    # 使用OpenAI客户端调用LLM
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=prompt,
+                        temperature=1,
+                        top_p=0.5,
+                    )
+                    
+                    end_time = time.time()
+                    llm_time = end_time - start_time
+                    
+                    # 记录token使用情况
+                    self.total_input_token += response.usage.prompt_tokens
+                    self.total_output_token += response.usage.completion_tokens
+                    print(f"[InitServer] Input tokens for attempt {num_try}: {response.usage.prompt_tokens}")
+                    print(f"[InitServer] Output tokens for attempt {num_try}: {response.usage.completion_tokens}")
+                    print(f"[InitServer] LLM API call time for attempt {num_try}: {llm_time:.2f} seconds")
+                    
+                    # 获取回复内容
+                    response_content = response.choices[0].message.content
+                    # print("=" * 20 + "Complete Response" + "=" * 20)
+                    # print(response_content)
+                    break
+                except AuthenticationError as e:
+                    print(f"[InitServer] Authentication error: {e}")
+                    print(f"[InitServer] Please check your API key.")
+                    response_content = ""  # 清空回复内容，触发后续的失败处理
+                    break  # 认证错误，直接跳出循环，不重试
+                except BadRequestError as e:
+                    print(f"[InitServer] Bad request error: {e}")
+                    print(f"[InitServer] Please check your request parameters.")
+                    response_content = ""  # 清空回复内容，触发后续的失败处理
+                    break  # 请求参数错误，直接跳出循环，不重试
+                except RateLimitError as e:
+                    print(f"[InitServer] Rate limit error: {e}")
+                    print(f"[InitServer] Too many requests, waiting before retry...")
+                    response_content = ""  # 清空回复内容，以便进行下一次尝试
+                    time.sleep(2)  # 速率限制，等待2秒后重试
+                except APIConnectionError as e:
+                    print(f"[InitServer] Connection error: {e}")
+                    print(f"[InitServer] Network issue, retrying...")
+                    response_content = ""  # 清空回复内容，以便进行下一次尝试
+                    time.sleep(1)  # 连接错误，等待1秒后重试
+                except APIError as e:
+                    print(f"[InitServer] API error: {e}")
+                    print(f"[InitServer] Server error, retrying...")
+                    response_content = ""  # 清空回复内容，以便进行下一次尝试
+                    time.sleep(1)  # API错误，等待1秒后重试
+                except Exception as e:
+                    print(f"[InitServer] Unexpected error: {e}")
+                    print(f"[InitServer] Unknown error, retrying...")
+                    response_content = ""  # 清空回复内容，以便进行下一次尝试
+                    time.sleep(1)  # 未知错误，等待1秒后重试
+                finally:
+                    # 减少LLM请求计数
+                    with self.llm_request_lock:
+                        self.llm_request_count -= 1
+                        # 删除锁文件
+                        os.remove(lock_file)
+            
+            if not response_content:
+                print("[InitServer] [!] All attempts failed, unable to get LLM response")
+                return
+            
+            # 移除Markdown注释
+            response_content = self.remove_markdown_comments(response_content)
+            
+            # # 备份原文件并写入新内容
+            # self.rename_file(real_init_script_path)
+            # 删除原文件并写入新内容
+            if os.path.exists(real_init_script_path):
+                os.remove(real_init_script_path)
+                # print(f"[InitServer] Deleted original init script: {real_init_script_path}")
+            
+            # print(f"[InitServer] Writing new init script to {real_init_script_path}")
+            with open(real_init_script_path, 'w', encoding='utf-8') as f:
+                f.write(response_content)
+            
+            # 复制过滤后的脚本到容器中
+            try:
+                tar_stream = io.BytesIO()
+                with tarfile.open(fileobj=tar_stream, mode='w') as tar:
+                    tar.add(real_init_script_path, arcname=os.path.basename(self.init_script_path))
+                tar_stream.seek(0)
+                docker_path = os.path.join(self.container_fs_path, os.path.dirname(self.init_script_path))
+                # 复制到容器中的对应路径
+                self.container.put_archive(path=docker_path, data=tar_stream.read())
+                # print(f"[InitServer] Successfully copied filtered init script to container")
+            except Exception as e:
+                print(f"[InitServer] Failed to copy filtered init script to container: {e}")
+                
+            # 解析新脚本
+            # print("[InitServer] Parsing LLM-generated init script")
+            try:
+                parse_success = self.parse_init_script()
+                
+                if parse_success:
+                    # 比较原始脚本和新脚本
+                    removed_commands, retained_commands = self.compare_original_and_new_commands()
+                    
+                    # 更新白名单和黑名单
+                    self.update_whitelist_and_blacklist(removed_commands, retained_commands)
+                else:
+                    print(f"[InitServer] [!] Failed to parse LLM-generated script")
+                    print(f"[InitServer] [!] Continuing without updating whitelist/blacklist")
+            except Exception as e:
+                print(f"[InitServer] [!] Failed to parse or compare scripts: {e}")
+                print(f"[InitServer] [!] Continuing without updating whitelist/blacklist")
+        except Exception as e:
+            print(f"[InitServer] [!] Error in filter_init_script: {e}")
+            print(f"[InitServer] [!] Continuing service operation")
 
     def resolve_init_script_path(self):
         """
