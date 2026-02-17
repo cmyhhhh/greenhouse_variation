@@ -648,7 +648,7 @@ class QemuRunner:
 
         print("Building docker image...")
         build_success = False
-        self.client = docker.from_env()
+        self.client = docker.from_env(timeout=120)
         while not build_success:
             try:
                 img, jsonlog = self.client.images.build(path=TMP_DIR, rm=True)
@@ -812,6 +812,10 @@ class QemuRunner:
             running_tally = dict() # running tally tracks "interrupted" loops
             while True:
                 current_llm_time = self.init_server.get_time()
+                # 确保 current_llm_time 是非负的
+                if current_llm_time < 0:
+                    print(f"Warning: Negative LLM time detected: {current_llm_time}, setting to 0")
+                    current_llm_time = 0
                 print(f"Current LLM_time: {current_llm_time}, Total LLM_time: {total_llm_time}")
                 total_llm_time += current_llm_time
                 time.sleep(INTERVAL_SIZE + current_llm_time)
@@ -1116,41 +1120,58 @@ class QemuRunner:
                             straceFile.write(line)
 
             cmd = "ls /%s" % DOCKER_FS
-            traceFiles = tempCont.exec_run(cmd)[1].splitlines()
+            try:
+                traceFiles = tempCont.exec_run(cmd)[1].splitlines()
+            except Exception as e:
+                print(f"Error listing files: {e}")
+                traceFiles = []
             print("Cleaning up...")
             # make sure to kill everything
             pids = []
-            out = tempCont.exec_run("ps -efww")[1]
-            app_name = os.path.basename(self.bin_path)
-            for process in out.splitlines():
-                print(f"    - {process}")
-                if b"ps -efww" in process:
-                    continue
-                # 过滤出目标应用的启动进程
-                if app_name.encode() in process:
-                    ps_target_app_startup.append(process)
-                fields = process.split()
-                pid = fields[1]
-                if pid.isdigit():
-                    pid = int(pid)
-                    if pid > 1:
-                        pids.append(pid)
+            try:
+                out = tempCont.exec_run("ps -efww")[1]
+                app_name = os.path.basename(self.bin_path)
+                for process in out.splitlines():
+                    print(f"    - {process}")
+                    if b"ps -efww" in process:
+                        continue
+                    # 过滤出目标应用的启动进程
+                    if app_name.encode() in process:
+                        ps_target_app_startup.append(process)
+                    fields = process.split()
+                    pid = fields[1]
+                    if pid.isdigit():
+                        pid = int(pid)
+                        if pid > 1:
+                            pids.append(pid)
+            except Exception as e:
+                print(f"Error getting process list: {e}")
+                print("Skipping process killing")
 
             for pid in pids:
                 print("    - killing %d" % pid)
-                tempCont.exec_run("kill -15 %d &" % pid, detach=True)
+                try:
+                    tempCont.exec_run("kill -15 %d &" % pid, detach=True)
+                except Exception as e:
+                    print(f"Error killing process {pid}: {e}")
 
             # try graceful termination first the -9 forcekill
             time.sleep(5)
             print("Trying Forcekill")
             for pid in pids:
                 print("    - force killing %d" % pid)
-                tempCont.exec_run("kill -9 %d &" % pid, detach=True)
+                try:
+                    tempCont.exec_run("kill -9 %d &" % pid, detach=True)
+                except Exception as e:
+                    print(f"Error force killing process {pid}: {e}")
 
             # remove old trace file
             for line in traceFiles:
                 if b"trace.log" in line:
-                    tempCont.exec_run("rm /%s &" % line, detach=True)
+                    try:
+                        tempCont.exec_run("rm /%s &" % line, detach=True)
+                    except Exception as e:
+                        print(f"Error removing trace file {line}: {e}")
             time.sleep(2)
 
         except Exception as e:
@@ -1181,7 +1202,11 @@ class QemuRunner:
                 print("Joining ContainerPsMonitor Thread...")
                 self.container_monitor_thread.join(timeout=5)
 
-            tempCont.stop()
+            try:
+                tempCont.stop(timeout=30)
+            except Exception as e:
+                print(f"Error stopping container: {e}")
+                print("Will try to force remove later")
 
         print("Emulation Terminated")
         totaltime = time.time() - starttime
@@ -1247,9 +1272,13 @@ class QemuRunner:
 
 
         time.sleep(10)
-        tempCont.remove(force=True)
-        time.sleep(5)
-        print("    - tempCont removed")
+        try:
+            tempCont.remove(force=True)
+            time.sleep(5)
+            print("    - tempCont removed")
+        except Exception as e:
+            print(f"Error removing container: {e}")
+            print("Continuing with cleanup")
         self.client.images.remove(img.id, force=True)
         print("    - client removed")
 
