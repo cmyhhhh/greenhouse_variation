@@ -721,6 +721,10 @@ class Planter():
             subprocess.run(binwalk_command)
             time.sleep(1)
 
+        # # Call kernelInit extraction
+        # if os.path.exists(extracted_path):
+        #     self.extract_kernel_init(img_path, extracted_path)
+
         fs_path = ""
         if fs_path_override != "":
             if os.path.exists(fs_path_override):
@@ -813,24 +817,58 @@ class Planter():
 
     def get_target_binary_and_init(self, fs_path, rehost_type):
         potential_binaries = self.get_potential_binaries(rehost_type)
-        potential_init = POTENTIAL_INIT
         pot_targets = dict()
-        pot_init = dict()
         bin_path_final = ""
         init_path_final = ""
+        
+        # 1. 收集所有潜在的init脚本路径，按照FirmAE的优先级顺序
+        init_candidates = []
+        
+        # 检查kernelInit文件（如果存在）
+        kernel_init_path = os.path.join(fs_path, "kernelInit")
+        if os.path.exists(kernel_init_path):
+            try:
+                with open(kernel_init_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        if '=' in line:
+                            full_path = line.split('=')[1].strip()
+                            if full_path:
+                                init_candidates.append(os.path.join(fs_path, full_path.lstrip('/')))
+            except:
+                pass
+        
+        # 检查/init
+        init_path = os.path.join(fs_path, "init")
+        if os.path.exists(init_path) and not os.path.isdir(init_path):
+            init_candidates.append(init_path)
+        
+        # 检查/sbin/init
+        sbin_init_path = os.path.join(fs_path, "sbin", "init")
+        if os.path.exists(sbin_init_path) and not os.path.isdir(sbin_init_path):
+            init_candidates.append(sbin_init_path)
+        
+        # # 查找所有名为preinitMT、preinit、rcS的文件
+        # for root, dirs, files in os.walk(fs_path):
+        #     for name in files:
+        #         if name in ["preinitMT", "preinit", "rcS", "rc", "profile"]:
+        #             full_path = os.path.join(root, name)
+        #             init_candidates.append(full_path)
+        
+        
+        
+        # 收集潜在的二进制文件
         for root, dirs, files in os.walk(fs_path, topdown=False):
             for name in files:
-                if name.lower() in potential_init:
-                    if name.lower() not in pot_init.keys():
-                        pot_init[name.lower()] = []
-                    pot_init[name.lower()].append(os.path.join(root, name))
+                if name in ["preinitMT", "preinit", "rcS", "rcs", "rc", "profile"]:
+                    full_path = os.path.join(root, name)
+                    init_candidates.append(full_path)
                 if name.lower() in potential_binaries:
                     if name.lower() not in pot_targets.keys():
                         pot_targets[name.lower()] = []
                     pot_targets[name.lower()].append(os.path.join(root, name))
 
         print("Potential Binaries: " + str(pot_targets))
-        print("Potential Init: " + str(pot_init))
+        print("Potential Init Candidates: " + str(unique_init_candidates))
         # return "best" match in order listed in potential_binaries
         for binary in potential_binaries:
             if binary in pot_targets.keys():
@@ -846,41 +884,20 @@ class Planter():
                 else:
                     continue
                 break
-
-        # 先判断是否全匹配，再看当前的init脚本路径是否在其他候选init脚本里，若没有则直接确定
-        for init in potential_init:
-            if init in pot_init.keys():
-                candidates = pot_init[init]
-                # 只有一个全匹配，直接确定
-                if len(candidates) == 1:
-                    init_path_final = candidates[0]
-                    print("    - Found init: %s" % init_path_final)
-                    break
-                # 多个全匹配，检查当前init路径是否出现在其他候选init脚本中
-                for init_path in candidates:
-                    appears_in_others = False
-                    # 转换成rehosting环境中的路径
-                    init_path_rel = init_path.replace(fs_path, "")
-                    # 遍历其他所有候选init脚本
-                    for other_init, other_paths in pot_init.items():
-                        if other_init == init:
-                            continue
-                        for other_path in other_paths:
-                            try:
-                                with open(other_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                    if init_path_rel in f.read():
-                                        appears_in_others = True
-                                        break
-                            except:
-                                continue
-                        if appears_in_others:
-                            break
-                    if not appears_in_others:
-                        init_path_final = init_path
-                        print("    - Found init: %s" % init_path_final)
-                        break
-                else:
-                    continue
+            
+            # 去重并保持原始顺序
+        seen = set()
+        unique_init_candidates = []
+        for candidate in init_candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                unique_init_candidates.append(candidate)
+        
+        # 验证候选文件并选择第一个有效的init脚本
+        for candidate in unique_init_candidates:
+            if os.path.exists(candidate) and not os.path.isdir(candidate):
+                init_path_final = candidate
+                print("    - Found init: %s" % init_path_final)
                 break
 
         return [bin_path_final, init_path_final]
@@ -1476,3 +1493,184 @@ class Planter():
                             for line in lines:
                                 confFile.write(line)
                         confFile.close()
+    
+    def extract_kernel_init(self, img_path, extracted_path):
+        """
+        Extract kernelInit file from firmware using FirmAE-style extraction logic
+        """
+        # FirmAE-style kernel extraction and init path detection
+        potential_kernel_files = []
+        
+        # 2. Use FirmAE's extraction logic (similar to extractor.py)
+        try:
+            import binwalk
+            import tempfile
+            import shutil
+            
+            print("    - Using FirmAE-style extraction logic")
+            
+            # Create temporary directory for extraction
+            temp_dir = tempfile.mkdtemp()
+            print(f"    - Created temporary directory: {temp_dir}")
+            
+            # Scan and extract firmware with binwalk (like FirmAE does)
+            print("    - Scanning firmware with binwalk...")
+            for module in binwalk.scan(img_path, "--run-as=root", "--preserve-symlinks",
+                    "-e", "-r", "-C", temp_dir, signature=True, quiet=True):
+                for entry in module.results:
+                    desc = entry.description
+                    dir_name = module.extractor.directory
+                    
+                    # Check for firmware headers (like FirmAE's _check_firmware)
+                    if 'header' in desc:
+                        # uImage header
+                        if "uImage header" in desc:
+                            if "OS Kernel Image" in desc:
+                                # Extract kernel from uImage
+                                kernel_offset = entry.offset + 64
+                                kernel_size = 0
+                                
+                                for stmt in desc.split(','):
+                                    if "image size:" in stmt:
+                                        kernel_size = int(''.join(
+                                            i for i in stmt if i.isdigit()), 10)
+                                
+                                if kernel_size > 0:
+                                    print(f"    - Found uImage kernel: offset={kernel_offset}, size={kernel_size}")
+                                    # Extract kernel using dd
+                                    kernel_path = os.path.join(temp_dir, "extracted_kernel")
+                                    with open(img_path, "rb") as ifp:
+                                        with open(kernel_path, "wb") as ofp:
+                                            ifp.seek(kernel_offset, 0)
+                                            ofp.write(ifp.read(kernel_size))
+                                    potential_kernel_files.append(kernel_path)
+                            
+                            # TP-Link or TRX header
+                            elif "rootfs offset: " in desc and "kernel offset: " in desc:
+                                image_size = os.path.getsize(img_path)
+                                kernel_offset = 0
+                                kernel_size = 0
+                                
+                                for stmt in desc.split(','):
+                                    if "kernel offset:" in stmt:
+                                        kernel_offset = int(stmt.split(':')[1], 16)
+                                    elif "kernel length:" in stmt:
+                                        kernel_size = int(stmt.split(':')[1], 16)
+                                
+                                kernel_offset += entry.offset
+                                
+                                if kernel_size == 0:
+                                    # Calculate kernel size if not provided
+                                    rootfs_offset = 0
+                                    for stmt in desc.split(','):
+                                        if "rootfs offset:" in stmt:
+                                            rootfs_offset = int(stmt.split(':')[1], 16)
+                                    rootfs_offset += entry.offset
+                                    kernel_size = rootfs_offset - kernel_offset
+                                
+                                if kernel_size > 0:
+                                    print(f"    - Found TP-Link/TRX kernel: offset={kernel_offset}, size={kernel_size}")
+                                    # Extract kernel using dd
+                                    kernel_path = os.path.join(temp_dir, "extracted_kernel")
+                                    with open(img_path, "rb") as ifp:
+                                        with open(kernel_path, "wb") as ofp:
+                                            ifp.seek(kernel_offset, 0)
+                                            ofp.write(ifp.read(kernel_size))
+                                    potential_kernel_files.append(kernel_path)
+                    
+                    # Check for kernel files (like FirmAE's _check_kernel)
+                    elif 'kernel' in desc:
+                        if "kernel version" in desc and "Linux" in desc:
+                            print(f"    - Found kernel file: {entry.filename}")
+                            kernel_path = os.path.join(dir_name, entry.filename)
+                            if os.path.exists(kernel_path):
+                                potential_kernel_files.append(kernel_path)
+                    
+                    # Check for compressed files and archives (like FirmAE's _check_recursive)
+                    elif 'filesystem' in desc or 'archive' in desc or 'compressed' in desc:
+                        if dir_name:
+                            # Recursively search for kernel files in extracted directory
+                            for root, dirs, files in os.walk(dir_name):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    try:
+                                        # Check file type
+                                        file_type = subprocess.check_output(["file", "-b", file_path], stderr=subprocess.STDOUT, text=True).strip().lower()
+                                        if any(keyword in file_type for keyword in ["kernel", "linux", "boot"]):
+                                            potential_kernel_files.append(file_path)
+                                    except Exception:
+                                        pass
+        except Exception as e:
+            print(f"    - FirmAE extraction failed, using fallback: {e}")
+        
+        # 3. Fallback: search for kernel files in extracted directory
+        if not potential_kernel_files:
+            print("    - Searching for kernel files in extracted directory...")
+            for root, dirs, files in os.walk(extracted_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if os.path.isfile(file_path):
+                        try:
+                            # Check file type
+                            file_type = subprocess.check_output(["file", "-b", file_path], stderr=subprocess.STDOUT, text=True).strip().lower()
+                            
+                            # Look for kernel-related files
+                            if any(keyword in file_type for keyword in ["kernel", "linux", "boot", "vmlinuz"]):
+                                potential_kernel_files.append(file_path)
+                            else:
+                                # Check file content
+                                strings_output = subprocess.check_output(["strings", file_path], stderr=subprocess.STDOUT, text=True).lower()
+                                if any(keyword in strings_output for keyword in ["linux version", "init=/", "kernel command line"]):
+                                    potential_kernel_files.append(file_path)
+                        except Exception:
+                            pass
+        
+        # 4. Process each potential kernel file (like FirmAE's inferKernel.py)
+        for kernel_path in potential_kernel_files:
+            print(f"    - Processing kernel file: {kernel_path}")
+            
+            # Create a scratch directory for processing (like FirmAE does)
+            scratch_dir = os.path.join(os.path.dirname(kernel_path), "scratch")
+            os.makedirs(scratch_dir, exist_ok=True)
+            
+            try:
+                # Step 1: Extract kernel version (like inferKernel.py line 28-29)
+                kernel_version_path = os.path.join(scratch_dir, "kernelVersion")
+                os.system(f"strings {kernel_path} | grep \"Linux version\" > {kernel_version_path}")
+                
+                # Step 2: Extract kernel command lines with init=/ (like inferKernel.py line 31-32)
+                kernel_cmd_path = os.path.join(scratch_dir, "kernelCmd")
+                os.system(f"strings {kernel_path} | grep \"init=/\" | sed -e 's/^\"//' -e 's/\"$//' > {kernel_cmd_path}")
+                
+                # Step 3: Parse kernelCmd to create kernelInit (like inferKernel.py ParseCmd function)
+                kernel_init_path = os.path.join(scratch_dir, "kernelInit")
+                init_paths = []
+                
+                if os.path.exists(kernel_cmd_path):
+                    with open(kernel_cmd_path, 'r') as f:
+                        cmds = f.read()
+                        for cmd in cmds.split('\n')[:-1]:
+                            if "init=/" in cmd:
+                                init_paths.append(cmd)
+                
+                # Write to kernelInit file if we found init paths
+                if init_paths:
+                    with open(kernel_init_path, "w") as f:
+                        for path in init_paths:
+                            f.write(path + "\n")
+                    print(f"    - Generated kernelInit file: {kernel_init_path}")
+                    
+                    # Also copy kernelInit to extracted path for easy access
+                    extracted_kernel_init = os.path.join(extracted_path, "kernelInit")
+                    shutil.copy(kernel_init_path, extracted_kernel_init)
+                    print(f"    - Copied kernelInit to: {extracted_kernel_init}")
+            except Exception as e:
+                print(f"    - Error extracting kernelInit: {e}")
+        
+        # 5. Clean up temporary directory
+        try:
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                print(f"    - Cleaned up temporary directory: {temp_dir}")
+        except Exception:
+            pass
