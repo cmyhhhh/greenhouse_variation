@@ -581,7 +581,15 @@ class QemuRunner:
         ws.close()
         print("done!")
 
-        init_command = "%s %s\n" % ("sh", self.relative_init_path)
+        # 判断 init 文件类型：若是 ELF 则直接执行；若是脚本则加 sh 解释器
+        with open(self.init_path, "rb") as f:
+            magic = f.read(4)
+        if magic[:4] == b"\x7fELF":
+            # ELF 可执行文件
+            init_command = "%s\n" % self.relative_init_path
+        else:
+            # 脚本文件
+            init_command = "%s %s\n" % ("sh", self.relative_init_path)
         
         with open(command_script_path, "w") as cs:
             cs.write("\n")
