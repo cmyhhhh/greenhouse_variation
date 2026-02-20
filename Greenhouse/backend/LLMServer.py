@@ -2004,7 +2004,7 @@ class ContainerPsMonitor:
         self.max_cmd_count = max_cmd_count
         self.banned_cmds_file = os.path.join(self.fs_path, "banned_cmds.txt")
         self.banned_cmds = self.load_banned_cmds()
-        # 保存banned_cmds对应的脚本文件路径
+        self.whitelist_cmds = {"qemu_run.sh", "qemu_run_target.sh"}
         self.banned_cmd_scripts = {}
         # shell脚本扩展名
         self.shell_extensions = {'.sh', '.bash', '.ksh', '.zsh', '.csh'}
@@ -2324,6 +2324,17 @@ class ContainerPsMonitor:
                     
                     # 如果命令次数超过max_cmd_count次，将其加入禁止列表并kill进程
                     if count > self.max_cmd_count:
+                        # 检查是否在白名单中（检查cmd是否包含白名单中的关键词）
+                        is_whitelisted = False
+                        for keyword in self.whitelist_cmds:
+                            if keyword in cmd:
+                                print(f"[ContainerPsMonitor] Command '{cmd}' matches whitelist keyword '{keyword}', skipping ban")
+                                is_whitelisted = True
+                                self.cmd_leaf_counts[cmd] = -10000
+                                break
+                        if is_whitelisted:
+                            continue
+                        
                         print(f"[ContainerPsMonitor] Command '{cmd}' exceeded {self.max_cmd_count} counts, banning and killing process {pid}")
                         # 添加到被禁止列表
                         self.banned_cmds.add(cmd)
@@ -2369,6 +2380,41 @@ class ContainerPsMonitor:
             set: 被禁止的命令集合
         """
         return self.banned_cmds
+    
+    def get_whitelist_cmds(self):
+        """
+        获取白名单关键词列表
+        
+        Returns:
+            set: 白名单关键词集合
+        """
+        return self.whitelist_cmds
+    
+    def add_to_whitelist(self, keyword):
+        """
+        将关键词添加到白名单
+        
+        Args:
+            keyword: 要添加到白名单的关键词
+        """
+        if keyword not in self.whitelist_cmds:
+            self.whitelist_cmds.add(keyword)
+            print(f"[ContainerPsMonitor] Added keyword to whitelist: {keyword}")
+        else:
+            print(f"[ContainerPsMonitor] Keyword already in whitelist: {keyword}")
+    
+    def remove_from_whitelist(self, keyword):
+        """
+        从白名单中移除关键词
+        
+        Args:
+            keyword: 要从白名单移除的关键词
+        """
+        if keyword in self.whitelist_cmds:
+            self.whitelist_cmds.remove(keyword)
+            print(f"[ContainerPsMonitor] Removed keyword from whitelist: {keyword}")
+        else:
+            print(f"[ContainerPsMonitor] Keyword not in whitelist: {keyword}")
     
     def run(self, interval=1):
         """
