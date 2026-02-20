@@ -868,7 +868,6 @@ class Planter():
                     pot_targets[name.lower()].append(os.path.join(root, name))
 
         print("Potential Binaries: " + str(pot_targets))
-        print("Potential Init Candidates: " + str(unique_init_candidates))
         # return "best" match in order listed in potential_binaries
         for binary in potential_binaries:
             if binary in pot_targets.keys():
@@ -892,6 +891,8 @@ class Planter():
             if candidate not in seen:
                 seen.add(candidate)
                 unique_init_candidates.append(candidate)
+        
+        print("Potential Init Candidates: " + str(unique_init_candidates))
         
         # 验证候选文件并选择第一个有效的init脚本
         for candidate in unique_init_candidates:
