@@ -291,6 +291,26 @@ function run_emulation()
             ./scratch/$IID/run_debug.sh &
             check_network ${IP} true
 
+            PING_TIME=-1
+            WEB_TIME=-1
+            RET_IP="None"
+
+            sleep 10
+            # Use Greenhouse-style HTTP checker
+            if [ -x "./scripts/greenhouse_checker.py" ]; then
+                echo "[*] Using Greenhouse-style HTTP checker"
+                # Convert IPS array to semicolon-separated string
+                IPS_STR="$(IFS=; echo "${IP[*]}")"
+                echo "[*] IPs: ${IPS_STR}"
+                # Call greenhouse_checker.py with correct parameters
+                result=$(python3 ./scripts/greenhouse_checker.py "${BRAND}" "/tmp" "$IPS_STR")
+                echo "[*] Greenhouse-style HTTP checker raw result: ${result}"
+                last_line=$(echo "$result" | tail -n 1)
+                read RET_IP CONNECT_RESULT WELLFORMED_RESULT CONNECT_TIME WELLFORMED_TIME <<< "$last_line"
+                echo "[*] Greenhouse-style HTTP checker result: ${RET_IP} ${CONNECT_RESULT} ${WELLFORMED_RESULT} ${CONNECT_TIME} ${WELLFORMED_TIME}"
+                IP=${RET_IP}
+            fi
+
             sleep 10
             ./debug.py ${IID}
 
