@@ -1010,6 +1010,11 @@ class Greenhouse():
             ## repeat until success, or no further Greenhouseing is possible / max cycles reached
             if self.max_cycles >= 0 and count >= self.max_cycles:
                 print("[Greenhouse] !! MAX CYCLES %d REACHED !!" % count)
+                # 如果目标应用日志不存在且修复手段用完也没有潜在的修复点，就需要推测目标应用启动命令，尝试单应用启动
+                if not self.is_target_app:
+                    self.is_target_app = True
+                    count = 0
+                    continue
                 if connected and not wellformed:
                     rehost_result = "PARTIAL"
                 # if self.batchfolder_path:
@@ -1239,7 +1244,7 @@ def main():
                     help='num seconds to simulate the target binary in qemu before timeout (default 20mins)')
     parser.add_argument('--max_depth', type=int, default=-1,
                     help='maximum bintrunk context-sensitive cfg to construct')
-    parser.add_argument('--max_cycles', type=int, default=30,
+    parser.add_argument('--max_cycles', type=int, default=15,
                     help='maximum number of patch cycles to attempt before giving up')
     parser.add_argument('--rehost_type', default="HTTP",
                     help='type of protocol binary to target [HTTP/UPNP/DNS/DHCP]')
