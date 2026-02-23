@@ -782,11 +782,46 @@ class QemuRunner:
                 
                 # 设置脚本执行权限
                 os.chmod(target_script_path, 0o755)
+                # 若容器内已存在 qemu_run_target.sh 则先删除
+                target_script_container_path = os.path.join("/", DOCKER_FS, "qemu_run_target.sh")
+                rm_cmd = f"rm -f {target_script_container_path}"
+                tempCont.exec_run(["/bin/sh", "-c", rm_cmd], detach=True)
+                # 将 qemu_run_target.sh 复制到容器的 DOCKER_FS 目录下
+                with open(target_script_path, "rb") as src:
+                    tempCont.put_archive("/"+DOCKER_FS, src.read())
+                print(f"    - copied {target_script_path} to {target_script_container_path}")
                 
-                # 在容器中执行目标应用启动脚本
-                target_exec_command = "/bin/sh ./%s/qemu_run_target.sh" % (DOCKER_FS)
-                print(f"    - executing target command: {target_exec_command}")
-                tempCont.exec_run(target_exec_command, stream=False, detach=True, tty=True)
+                # 构造qemu执行命令来运行目标应用
+                target_logfilename = "/"+TRACE_LOG
+                target_qemu_command = ["chroot", DOCKER_FS, "/"+self.qemu_arch]
+                target_qemu_command.extend(["-pconly"])
+                target_qemu_command.extend(["-llm"])
+                if self.hackbind and not self.baseline_mode:
+                    target_qemu_command.extend(["-hackbind"])
+                if self.hackdevproc and not self.baseline_mode:
+                    target_qemu_command.extend(["-hackproc"])
+                if self.hacksysinfo and not self.baseline_mode:
+                    target_qemu_command.extend(["-hacksysinfo"])
+                target_qemu_command.extend(["-D", "qemu_run_target_"+TRACE_LOG+"1"])
+                target_qemu_command.extend(["-strace"])
+                
+                target_qemu_command.extend(["-execve", "\"/"+self.qemu_arch+" -pconly"])
+                target_qemu_command.extend(["-llm"])
+                if self.hackbind and not self.baseline_mode:
+                    target_qemu_command.extend(["-hackbind"])
+                if self.hackdevproc and not self.baseline_mode:
+                    target_qemu_command.extend(["-hackproc"])
+                if self.hacksysinfo and not self.baseline_mode:
+                    target_qemu_command.extend(["-hacksysinfo"])
+                target_qemu_command.extend(["-strace"])
+                target_qemu_command.extend(["-D "+target_logfilename+"\""])
+                if not self.baseline_mode:
+                    target_qemu_command.extend(["-E", "PATH=\"/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin:/usr/local/bin\"", "-E", "LD_PRELOAD=\"libnvram-faker.so\""])
+                target_qemu_command.extend(["/bin/sh", "qemu_run_target.sh", ">", "/"+DOCKER_FS+"/"+GREENHOUSE_LOG, "2>&1"])
+                
+                target_docker_command = " ".join(target_qemu_command)
+                print(f"    - executing target command: {target_docker_command}")
+                tempCont.exec_run(target_docker_command, stream=False, detach=True, tty=True)
                 print("    - target app startup command executed")
 
             # print("-"*50)
