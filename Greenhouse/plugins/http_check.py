@@ -82,6 +82,49 @@ class URLCheck:
                 elif "reset by peer" in str(e):
                     retry = True
                     is_ssl = True
+                # # TODO: 处理QEMU日志混入HTTP响应的情况，但下方代码是否能处理未知
+                # elif "HeaderParsingError" in str(e):
+                #     # 处理QEMU日志混入HTTP响应的情况
+                #     print("    - Header parsing error detected, trying to handle QEMU logs")
+                #     # 使用更底层的方法获取响应，手动处理QEMU日志
+                #     import urllib3
+                #     http = urllib3.PoolManager()
+                #     try:
+                #         # 禁用头部解析错误检查
+                #         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                #         # 发送请求并获取原始响应
+                #         response = http.request('GET', self.url, headers=self.headers, timeout=5)
+                #         # 获取原始响应数据
+                #         raw_data = response.data.decode('utf-8', errors='ignore')
+                #         # 过滤掉QEMU日志信息
+                #         filtered_data = ""
+                #         in_http_response = False
+                #         for line in raw_data.split('\n'):
+                #             if line.startswith('HTTP/'):
+                #                 in_http_response = True
+                #             if in_http_response:
+                #                 filtered_data += line + '\n'
+                #         # 检查过滤后的数据是否包含有效的HTTP响应
+                #         if 'HTTP/' in filtered_data:
+                #             print("    - Successfully filtered QEMU logs from response")
+                #             self.last_status_code = 200
+                #             # 模拟一个简单的响应对象
+                #             class MockResponse:
+                #                 def __init__(self, status_code, text, url):
+                #                     self.status_code = status_code
+                #                     self.text = text
+                #                     self.headers = {}
+                #                     self.url = url
+                #                     self.ok = status_code < 400
+                #                     self.content = text.encode('utf-8')
+                #             r = MockResponse(200, filtered_data, self.url)
+                #             retry = False
+                #         else:
+                #             print("    - Failed to find valid HTTP response after filtering")
+                #             self.last_status_code = 400
+                #     except Exception as e2:
+                #         print("    - Error handling QEMU logs:", e2)
+                #         self.last_status_code = 400
 
                 if self.last_status_code != -1 and not is_ssl and self.url.endswith("443"):
                     retry = True
@@ -198,7 +241,7 @@ class URLCheck:
             print("[+] Probing %s..." % self.url)
             reply = self.curlcheck()
 
-            # check if response is 200 or 401:
+            # check if response is 2xx or 401:
             #   - if so, run login script and update the session in use
             #   - rerun curlcheck with new session
             #   - if login script does not find anything and response is 200, proceed
@@ -371,7 +414,7 @@ if __name__ == "__main__":
 	checker = HTTPInteractionCheck(brand, analysis_path)
 	probe_success = checker.probe(potential_urls, ports)
 	if probe_success:
-		success, wellformed, curlsuccess = checker.check(trace=None, exit_code=None, timedout=False, errored=False, strict=True)
+		success, wellformed, curlsuccess = checker.check(exit_code=None, timedout=False, errored=False, strict=True)
 		if success and wellformed:
 			print("Success, filesystem runs!")
 	else:

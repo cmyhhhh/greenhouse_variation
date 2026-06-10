@@ -13,7 +13,60 @@ import subprocess
 # import pathlib
 
 
-GH_SUCCESS_TAG = "GH_SUCCESSFUL_CACHE"
+# FIRMAE_TAG = "GH_SUCCESSFUL_CACHE"
+FIRMAE_TAG = "FIRMAE_TAG"
+
+# 辅助函数：为参数值添加单引号
+def format_args_with_quotes(args_str):
+    if not args_str:
+        return ""
+    
+    args = args_str.split()
+    formatted_args = []
+    i = 0
+    while i < len(args):
+        if args[i].startswith('-'):
+            # 处理选项参数
+            if i + 1 < len(args) and not args[i+1].startswith('-'):
+                # 收集所有连续的非选项参数
+                j = i + 1
+                while j < len(args) and not args[j].startswith('-'):
+                    j += 1
+                # 组合所有连续的非选项参数
+                combined_value = " ".join(args[i+1:j])
+                # 检查参数值是否已经被单引号或双引号包裹
+                if combined_value.startswith("'") and combined_value.endswith("'"):
+                    # 已经被单引号包裹，保持不变
+                    pass
+                elif combined_value.startswith('"') and combined_value.endswith('"'):
+                    # 已经被双引号包裹，转换为单引号
+                    combined_value = f"'{combined_value[1:-1]}'"
+                else:
+                    # 未被引号包裹，添加单引号
+                    combined_value = f"'{combined_value}'"
+                formatted_args.append(args[i])
+                formatted_args.append(combined_value)
+                i = j
+            else:
+                # 无参数的选项
+                formatted_args.append(args[i])
+                i += 1
+        else:
+            # 非选项参数
+            arg_value = args[i]
+            # 检查参数值是否已经被单引号或双引号包裹
+            if arg_value.startswith("'") and arg_value.endswith("'"):
+                # 已经被单引号包裹，保持不变
+                pass
+            elif arg_value.startswith('"') and arg_value.endswith('"'):
+                # 已经被双引号包裹，转换为单引号
+                arg_value = f"'{arg_value[1:-1]}'"
+            else:
+                # 未被引号包裹，添加单引号
+                arg_value = f"'{arg_value}'"
+            formatted_args.append(arg_value)
+            i += 1
+    return " ".join(formatted_args)
 
 class Greenhouse():
     REHOST_TYPE_MAP = {"HTTP" : "HTTP",
@@ -48,6 +101,7 @@ class Greenhouse():
         self.runner = None
         self.cache_path = args.cache_path
         self.name = ""
+        self.fs_backup_path = ""
         self.target_cache_path = ""
         # 初始化token统计变量
         self.total_input_tokens = 0
@@ -57,6 +111,7 @@ class Greenhouse():
         # llm
         self.api_key = args.api_key
         self.model = args.model
+        self.no_services = args.no_services
         
         # 目标应用的启动命令
         self.target_app_startup = None
@@ -103,6 +158,47 @@ class Greenhouse():
 
         # defaults
         self.changelog = []
+
+    def custom_copytree(self, src, dst):
+        """
+        自定义的copytree函数，处理软链接和异常情况
+        
+        Args:
+            src: 源目录路径
+            dst: 目标目录路径
+        """
+        import os
+        import shutil
+        # Create destination directory if it doesn't exist
+        os.makedirs(dst, exist_ok=True)
+        # Walk through source directory
+        for item in os.listdir(src):
+            s = os.path.join(src, item)
+            d = os.path.join(dst, item)
+            try:
+                if os.path.islink(s):
+                    # Handle symlinks by preserving them
+                    linkto = os.readlink(s)
+                    # print(f"    - Preserving symlink {s} -> {linkto}")
+                    if os.path.exists(d):
+                        if os.path.islink(d):
+                            os.unlink(d)
+                        else:
+                            if os.path.isdir(d):
+                                shutil.rmtree(d)
+                            else:
+                                os.remove(d)
+                    os.symlink(linkto, d)
+                elif os.path.isdir(s):
+                    # Recursively copy directories
+                    self.custom_copytree(s, d)
+                else:
+                    # Copy files
+                    shutil.copy2(s, d)
+            except Exception as e:
+                print(f"    - Error copying {s} to {d}: {e}")
+                # Continue with other files
+                pass
 
     def reset_paths(self):
         self.target_bin_override = ""
@@ -169,15 +265,21 @@ class Greenhouse():
         print("-"*100)
 
         # unpack image & find target filesystem
-        self.gh = Planter(gh_path=self.gh_src_path, scripts_path=self.scripts_path, qemu_src_path=self.qemu_src_path, brand=self.brand)
+        self.gh = Planter(gh_path=self.gh_src_path, scripts_path=self.scripts_path, qemu_src_path=self.qemu_src_path, brand=self.brand, no_services=self.no_services)
         self.fs_path = self.gh.unpack_image(img_path, fs_path_override=self.fs_path_override, workspace=self.workspace)
         if self.fs_path == "":
             print("    - Error, unable to unpack image for %s" % img_path)
             return False 
 
+        output_dir = self.workspace if self.workspace else os.path.dirname(self.img_path)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        # 从固件中提取内核
+        kernel_path = self.gh.extract_kernel_from_firmware(self.img_path, output_dir, self.firmae_path)
+        
         # find target binary to run
         if self.target_bin_override == "":
-            self.bin_path, self.init_path = self.gh.get_target_binary_and_init(self.fs_path, self.rehost_type)
+            self.bin_path, self.init_path = self.gh.get_target_binary_and_init(self.fs_path, self.rehost_type, kernel_path)
         else:
             if self.fs_path not in self.target_bin_override:
                 self.target_bin_override = self.target_bin_override.strip("/")
@@ -200,6 +302,20 @@ class Greenhouse():
             return False
         self.qemu_path = self.gh.get_qemu_run_path()
         self.qemu_arch = self.gh.get_qemu_arch()
+        
+        # # backup firmware filesystem after all processing
+        # self.fs_backup_path = self.fs_path + ".backup"
+        # if os.path.exists(self.fs_backup_path):
+        #     print("    - Backup directory %s already exists, skipping backup" % self.fs_backup_path)
+        # else:
+        #     print("    - Backing up firmware filesystem to %s" % self.fs_backup_path)
+        #     try:
+        #         self.custom_copytree(self.fs_path, self.fs_backup_path)
+        #         print("    - Backup completed (some files may have been skipped due to errors)")
+        #     except Exception as e:
+        #         print(f"    - Error during backup: {e}")
+        #         # Continue even if backup fails
+        #         pass
 
         # Check for nvram functions in binary using readelf or strings
         print("Checking for nvram functions in binary...")
@@ -308,7 +424,43 @@ class Greenhouse():
                 print("#"*100)
                 print("Outputting results to", self.output_dst_path)
             if self.setup_target(img_path):
-                ret = self.patch_loop()
+                # 先执行使用init脚本启动的patch_loop_init函数
+                ret = self.patch_loop_init()
+                
+                # 如果 patch_loop_init 托管成功（返回 0），则不执行 patch_loop
+                if ret != 0:
+                    # 执行不使用init脚本启动的patch_loop函数前的准备工作
+                    print("#"*100)
+                    print("Preparing for target app startup...")
+                    print("#"*100)
+                    
+                    # # 备份当前的self.fs_path，备份文件夹名前加上init
+                    # init_backup_path = self.fs_path + ".init_backup"
+                    # print("    - Backing up current filesystem to", init_backup_path)
+                    # if os.path.exists(init_backup_path):
+                    #     print("    - Backup directory already exists, removing it first")
+                    #     import shutil
+                    #     shutil.rmtree(init_backup_path)
+                    # import shutil
+                    # # 使用类的custom_copytree方法
+                    # self.custom_copytree(self.fs_path, init_backup_path)
+                    # print("    - Backup completed")
+                    
+                    # # 删除当前的self.fs_path
+                    # print("    - Removing current filesystem", self.fs_path)
+                    # shutil.rmtree(self.fs_path)
+                    
+                    # # 把备份过的self.fs_backup_path拷贝到self.fs_path
+                    # print("    - Restoring filesystem from original backup", self.fs_backup_path)
+                    # # 也使用类的custom_copytree方法来恢复
+                    # self.custom_copytree(self.fs_backup_path, self.fs_path)
+                    # print("    - Filesystem restored")
+                    
+                    # # 执行不使用init脚本启动的patch_loop函数
+                    # print("#"*100)
+                    # print("Running patch_loop (without init script)...")
+                    # print("#"*100)
+                    ret = self.patch_loop()
         except Exception as e:
             print("!"*100)
             print("Generic exception handler for future debugging")
@@ -337,7 +489,7 @@ class Greenhouse():
         print("="*100)
         skiplist = self.read_skiplist(self.skipfile)
         print("[Batch] START ", time.ctime())
-        starttime = time.time()
+        starttime = time.monotonic()
         for target in paths:
             if target in skiplist:
                 print("    [Batch] Skipping %s in skiplist" % target)
@@ -350,7 +502,7 @@ class Greenhouse():
             self.reset_paths()
         print("[Batch] ALL PATHS COMPLETE")
         print("[Batch] END ", time.ctime())
-        totaltime = time.time() - starttime
+        totaltime = time.monotonic() - starttime
         print("[Batch] TIME TAKEN = ", (totaltime / 60), "mins")
         print("="*100)
 
@@ -451,13 +603,32 @@ class Greenhouse():
         binary_name = os.path.basename(self.bin_path)
         firmae = FirmAEwrapper(binary_name, self.brand, self.firmae_path, mount_path, self.scripts_path, self.analysis_path, self.bg_scripts)
 
+        # 定义FIRMAE_TAG文件路径
+        firmae_tag = os.path.join(self.target_cache_path, "FIRMAE_TAG")
+        
         use_cache = False
+        use_firmae_tag = False
+        cached_new_run_args = ""
+        cached_cwdpath = ""
+        cached_success = False
+        
         if os.path.exists(self.target_cache_path):
-            success_tag = os.path.join(self.target_cache_path, GH_SUCCESS_TAG)
-            if os.path.exists(success_tag):
+            if os.path.exists(firmae_tag):
                 use_cache = True
-            else:                
-                Files.rm_folder(self.target_cache_path)
+                print("    - FIRMAE_TAG exists, reading cached values...")
+                try:
+                    with open(firmae_tag, 'r', encoding='latin-1') as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            if line.startswith("new_run_args="):
+                                cached_new_run_args = line.split("=", 1)[1].strip()
+                            elif line.startswith("cwdpath="):
+                                cached_cwdpath = line.split("=", 1)[1].strip()
+                            elif line.startswith("success="):
+                                cached_success = line.split("=", 1)[1].strip().lower() == "true"
+                    use_firmae_tag = True
+                except Exception as e:
+                    print(f"    - Error reading FIRMAE_TAG: {e}")
 
         if use_cache:
             print("    - working cache exists, using cached fullhost values...")
@@ -488,26 +659,54 @@ class Greenhouse():
         time.sleep(2) # pause for dramatic effect
 
         # extract values from fullrehost
-        if success:
-            if os.path.exists(self.target_cache_path):
-                print("    - copying from", self.target_cache_path)
-                self.gh.clean_fs(self.target_cache_path)
-                Files.copy_overwrite_dir_contents(self.target_cache_path, self.fs_path)
-                devPath = os.path.join(self.fs_path, "dev")
-                ghdevPath = os.path.join(self.fs_path, "ghdev")
-                Files.copy_overwrite_dir_contents(devPath, ghdevPath)
-                update_success = firmae.update_ps(self.target_cache_path)
-                found_ps, new_run_args = firmae.get_run_args(self.target_cache_path, binary_name)
-                print("      | [found_ps]:", found_ps)
-                print("                   - ", new_run_args)
-                print("      | [update_success]: ", update_success)
-                self.ps_success = update_success # and found_ps
-                cwdpath = firmae.get_cwd(self.target_cache_path)
-            else:
-                print("    - error, fullrehost was successful but unable to copy results")
-                success = False
+        new_run_args = ""
+        cwdpath = ""
+        firmae_success = False
+        
+        if use_firmae_tag:
+            # 从FIRMAE_TAG读取的值
+            new_run_args = cached_new_run_args
+            cwdpath = cached_cwdpath
+            firmae_success = cached_success
+            print("    - Using values from FIRMAE_TAG:")
+            print("      | new_run_args:", new_run_args)
+            print("      | cwdpath:", cwdpath)
+            print("      | success:", firmae_success)
         else:
-            print("    - FirmAE Rehost failed, skipping copying...")
+            if success:
+                if os.path.exists(self.target_cache_path):
+                    print("    - copying from", self.target_cache_path)
+                    self.gh.clean_fs(self.target_cache_path)
+                    Files.copy_overwrite_dir_contents(self.target_cache_path, self.fs_path)
+                    devPath = os.path.join(self.fs_path, "dev")
+                    ghdevPath = os.path.join(self.fs_path, "ghdev")
+                    Files.copy_overwrite_dir_contents(devPath, ghdevPath)
+                    update_success = firmae.update_ps(self.target_cache_path)
+                    found_ps, new_run_args = firmae.get_run_args(self.target_cache_path, binary_name)
+                    print("      | [found_ps]:", found_ps)
+                    print("                   - ", new_run_args)
+                    print("      | [update_success]: ", update_success)
+                    self.ps_success = update_success # and found_ps
+                    cwdpath = firmae.get_cwd(self.target_cache_path)
+                    firmae_success = success
+                else:
+                    print("    - error, fullrehost was successful but unable to copy results")
+                    success = False
+                    firmae_success = False
+            else:
+                print("    - FirmAE Rehost failed, skipping copying...")
+                firmae_success = False
+            
+            # 无论FirmAE Rehost是否成功，都创建FIRMAE_TAG文件，保存运行结果
+            print("    - Creating FIRMAE_TAG with rehost values...")
+            try:
+                with open(firmae_tag, 'w') as f:
+                    f.write(f"new_run_args={new_run_args}\n")
+                    f.write(f"cwdpath={cwdpath}\n")
+                    f.write(f"success={firmae_success}\n")
+                print("    - FIRMAE_TAG created successfully")
+            except Exception as e:
+                print(f"    - Error creating FIRMAE_TAG: {e}")
 
         if use_cache or len(IID) > 0:
             # update nvrams
@@ -526,17 +725,17 @@ class Greenhouse():
             print("    - done!")
 
         print("      | [cwdpath]:", cwdpath)
-        if cwdpath is None:
+        if cwdpath is None or cwdpath == "None":
             cwdpath = ""
         else:
             self.cwd_success = True
         self.rh_success = success
         print("      | [rh_success]:", self.rh_success)
 
-        return new_run_args, cwdpath, success
+        return new_run_args, cwdpath, firmae_success
 
     ## patch loop
-    def patch_loop(self):
+    def patch_loop_init(self):
         targets = set(".")
         configs = set()
         self.changelog = []
@@ -579,8 +778,12 @@ class Greenhouse():
         nd_flags = ["-D", "-X", "-n", "-d"]
         ndflag_index = 0
         patch_blacklist = []
+        changed_cwd = False
         self.ip_targets_path = os.path.join(self.fs_path, "target_urls")
         self.ports_path = os.path.join(self.fs_path, "target_ports")
+        
+        # Set maximum loop count to 10 for patch_loop_init
+        max_cycles = 10
 
         if self.enable_dedaemon:
             needs_dedaemon = True
@@ -588,21 +791,13 @@ class Greenhouse():
             patch_blacklist = ["daemon_fork"]
 
         print("[GREENHOUSE] RUNNING ", time.ctime())
-        starttime = time.time()
+        starttime = time.monotonic()
 
         checker = self.get_checker()
         sparser = TraceParser(fs_path=self.fs_path)
         patcher = None
         if not self.nopatch:
             patcher = Patcher(blacklist=patch_blacklist)
-        self.runner = QemuRunner(self.fs_path, self.bin_path, self.init_path, self.qemu_arch, self.sha256hash,
-                                 checker, changelog=self.changelog, docker_ip=self.docker_ip,
-                                 baseline_mode=self.baseline,
-                                 hackbind=self.hackbind,
-                                 hackdevproc=self.hackdevproc,
-                                 hacksysinfo=self.hacksysinfo,
-                                 api_key=self.api_key,
-                                 model=self.model)
         
         # setup ip targets
         if not os.path.exists(self.ip_targets_path):
@@ -631,7 +826,7 @@ class Greenhouse():
                 if self.extra_args.strip() != new_run_args.strip():
                     self.changelog.append("[ROADBLOCK] requires specific run time args")
                     self.changelog.append(pslog)
-                self.extra_args = new_run_args
+                self.extra_args = format_args_with_quotes(new_run_args)
             if len(cwdpath) > 0:
                 cwdlog = "    - replacing bin_cwd " + bin_cwd + " with " + cwdpath
                 print(cwdlog)
@@ -669,7 +864,109 @@ class Greenhouse():
             print("    - background scripts mechanism disabled")
             bg_cmds = []
             bg_sleep = 0
-
+            
+        # 检查是否存在 /current_init 文件
+        if os.path.exists('/current_init'):
+            # 复制/current_init到fs_path
+            shutil.copy('/current_init', self.fs_path)
+            with open('/current_init', 'r') as f:
+                init_from_file = f.read().strip()
+                print(f"[*] init_from_file: {init_from_file}")
+                if init_from_file and "firmadyne" not in init_from_file:
+                    full_init_path = os.path.join(self.fs_path, init_from_file.lstrip('/'))
+                    # 检查full_init_path是否存在，若存在去除其中带有firmadyne的行
+                    if os.path.exists(full_init_path):
+                        print(f"[*] Using init from current_init: {init_from_file}")
+                        print(f"[*] Full init path: {full_init_path}")
+                        # Check if the file is an ELF binary
+                        is_elf = False
+                        try:
+                            with open(full_init_path, 'rb') as f:
+                                header = f.read(4)
+                                is_elf = header == b'\x7fELF'
+                        except:
+                            pass
+                        
+                        # 检查是否是软连接
+                        is_symlink = os.path.islink(full_init_path)
+                        
+                        # 无论是否是软连接或ELF文件，都设置self.init_path
+                        self.init_path = full_init_path
+                        
+                        if is_symlink:
+                            print(f"[*] Using symlink: {full_init_path}")
+                        elif not is_elf:
+                            # Only filter if it's a text file
+                            try:
+                                with open(full_init_path, 'r') as init_file:
+                                    lines = init_file.readlines()
+                                filtered_lines = [line for line in lines if 'firmadyne' not in line.lower()]
+                                with open(full_init_path, 'w') as init_file:
+                                    init_file.writelines(filtered_lines)
+                            except Exception as e:
+                                print(f"[*] Error processing init file: {e}")
+                        else:
+                            print(f"[*] Using ELF binary: {full_init_path}")
+                    else:
+                        print(f"[*] Init path from current_init does not exist: {full_init_path}")
+        
+        # 检查是否存在 /FirmAEInit 文件
+        if os.path.exists('/FirmAEInit'):
+            # 复制/FirmAEInit到fs_path
+            shutil.copy('/FirmAEInit', self.fs_path)
+            with open('/FirmAEInit', 'r') as f:
+                init_from_file = f.read().strip()
+                print(f"[*] init_from_file: {init_from_file}")
+                if init_from_file and "firmadyne" not in init_from_file:
+                    full_init_path = os.path.join(self.fs_path, init_from_file.lstrip('/'))
+                    # 检查full_init_path是否存在，若存在去除其中带有firmadyne的行
+                    if os.path.exists(full_init_path):
+                        print(f"[*] Using init from FirmAEInit: {init_from_file}")
+                        print(f"[*] Full init path: {full_init_path}")
+                        # Check if the file is an ELF binary
+                        is_elf = False
+                        try:
+                            with open(full_init_path, 'rb') as f:
+                                header = f.read(4)
+                                is_elf = header == b'\x7fELF'
+                        except:
+                            pass
+                        
+                        # 检查是否是软连接
+                        is_symlink = os.path.islink(full_init_path)
+                        
+                        # 无论是否是软连接或ELF文件，都设置self.init_path
+                        self.init_path = full_init_path
+                        
+                        if is_symlink:
+                            print(f"[*] Using symlink: {full_init_path}")
+                        elif not is_elf:
+                            # Only filter if it's a text file
+                            try:
+                                with open(full_init_path, 'r') as init_file:
+                                    lines = init_file.readlines()
+                                filtered_lines = [line for line in lines if 'firmadyne' not in line.lower()]
+                                with open(full_init_path, 'w') as init_file:
+                                    init_file.writelines(filtered_lines)
+                            except Exception as e:
+                                print(f"[*] Error processing init file: {e}")
+                        else:
+                            print(f"[*] Using ELF binary: {full_init_path}")
+                    else:
+                        print(f"[*] Init path from FirmAEInit does not exist: {full_init_path}")
+        
+        self.runner = QemuRunner(self.fs_path, self.bin_path, self.init_path, self.qemu_arch, self.sha256hash,
+                                 checker, changelog=self.changelog, docker_ip=self.docker_ip,
+                                 baseline_mode=self.baseline,
+                                 hackbind=self.hackbind,
+                                 hackdevproc=self.hackdevproc,
+                                 hacksysinfo=self.hacksysinfo,
+                                 api_key=self.api_key,
+                                 model=self.model,
+                                 no_services=self.no_services)
+        # 设置 shell_exec_init 变量，默认为 False
+        shell_exec_init = False
+        
         while True:
             label = "###################### PATCH LOOP [%d] ######################" % count
             self.write_changelog(self.changelog)
@@ -683,7 +980,7 @@ class Greenhouse():
             
             # run target binary in docker via qemu-user
             if self.is_target_app:
-                emulation_output, exit_code, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts = self.runner.run(timeout=self.timeout, bin_cwd=bin_cwd,
+                emulation_output, exit_code, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts = self.runner.run_init(timeout=self.timeout, bin_cwd=bin_cwd,
                                                                                                 potential_urls=self.urls,
                                                                                                 ports_file=self.ports_path,
                                                                                                 extra_args=self.extra_args,
@@ -694,12 +991,14 @@ class Greenhouse():
                                                                                                 has_ipv6=has_ipv6,
                                                                                                 greenhouse_mode=greenhouse_mode,
                                                                                                 need_infer_startup=need_infer_startup,
-                                                                                                target_app_startup=self.target_app_startup)
+                                                                                                target_app_startup=self.target_app_startup,
+                                                                                                enable_ContainerPsMonitor=True,
+                                                                                                shell_exec_init=shell_exec_init)
                 if inferred_startup_cmd:
                     self.target_app_startup = inferred_startup_cmd
             # 仅启动init脚本，不额外启动目标应用
             else:
-                emulation_output, exit_code, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts = self.runner.run(timeout=self.timeout, bin_cwd=bin_cwd,
+                emulation_output, exit_code, timedout, time_to_up, banned_cmds, inferred_startup_cmd, filtered_scripts = self.runner.run_init(timeout=self.timeout, bin_cwd=bin_cwd,
                                                                                                 potential_urls=self.urls,
                                                                                                 ports_file=self.ports_path,
                                                                                                 extra_args=self.extra_args,
@@ -709,7 +1008,8 @@ class Greenhouse():
                                                                                                 mac=mac,
                                                                                                 has_ipv6=has_ipv6,
                                                                                                 greenhouse_mode=greenhouse_mode,
-                                                                                                need_infer_startup=need_infer_startup)
+                                                                                                need_infer_startup=need_infer_startup,
+                                                                                                shell_exec_init=shell_exec_init)
                 if inferred_startup_cmd:
                     self.target_app_startup = inferred_startup_cmd
                     
@@ -761,16 +1061,21 @@ class Greenhouse():
             # segfaulted: 如果emulation_dump中包含"SIGSEGV"，则为True，表示程序发生了段错误
             # is_daemonized: 如果程序调用了fork并退出，则为True，表示程序以守护进程方式运行
             # 判断 self.fs_path 文件夹下是否存在目标应用日志
+            print("    - [Parsing Logs] Starting...")
+            parse_start_time = time.monotonic()
             targets, folders, configs, ip_addrs, ipv6_addrs, ports, interfaces, failed, segfaulted, is_daemonized = sparser.parse(
                                 emulation_output, "", forkmap=forkmap)
             binary_name = os.path.basename(self.bin_path)
             log_prefix = f"{binary_name}_trace.log"
             trace_path_full = os.path.join(self.fs_path, f"{log_prefix}1.tar")
+            exist_target_log = False
             if not os.path.exists(trace_path_full):
                 print(f"target log file not found: {trace_path_full}")
             else:
                 # 解析所有以 {binary_name}_trace.log 开头的日志文件
                 try:
+                    print(f"target log file found: {trace_path_full}")
+                    exist_target_log = True
                     all_files = os.listdir(self.fs_path)
                     for fname in all_files:
                         if fname.startswith(log_prefix):
@@ -793,35 +1098,49 @@ class Greenhouse():
                     print(f"解析额外 {log_prefix} 日志时出错: {str(e)}")
 
             # process log files containing trace.log in trace_path
-            print("Processing other trace.log files...")
-            # 获取trace_path目录下包含"trace.log"的所有文件
-            try:
-                all_files = os.listdir(self.fs_path)
-                trace_log_files = [f for f in all_files if "trace.log" in f and not f.startswith(log_prefix)]
-
-                if trace_log_files and "No such file" not in trace_log_files[0]:
-                    print(f"Found {len(trace_log_files)} trace.log files: {trace_log_files}")
-
-                    for log_file in trace_log_files:
-                        log_file_path = os.path.join(self.fs_path, log_file)
-                        subtargets, subfolders, subconfigs, subip_addrs, subipv6_addrs, sub_ports, subinterfaces, subfailed, subfaulted, _ = sparser.parse(
-                            "", log_file_path, forkmap=forkmap)
-                        targets.update(subtargets)
-                        folders.update(subfolders)
-                        configs.update(subconfigs)
-                        # ip_addrs.update(subip_addrs)
-                        # ipv6_addrs.update(subipv6_addrs)
-                        # ports.update(sub_ports)
-                        interfaces.update(subinterfaces)
-                        failed.update(subfailed)
-                        if subfaulted:
-                            errored = True
-                            exit_code = -11
-                else:
-                    print("No trace.log files found in trace_path")
+            if not exist_target_log:
+                print("Processing other trace.log files...")
+                # 获取trace_path目录下包含"trace.log"的所有文件
+                try:
+                    all_files = os.listdir(self.fs_path)
+                    trace_log_files = [f for f in all_files if "trace.log" in f and not f.startswith(log_prefix)]
                     
-            except Exception as e:
-                print(f"Error processing trace.log files: {str(e)}")
+                    # 检查是否只有一个日志文件
+                    if shell_exec_init == False and len(trace_log_files) <= 1:
+                        print("Setting shell_exec_init to True and restarting rehost with count=0")
+                        # 将shell_exec_init改为True，count置为0，重新开始循环
+                        shell_exec_init = True
+                        count = 0
+                        continue
+
+                    if trace_log_files and "No such file" not in trace_log_files[0]:
+                        print(f"Found {len(trace_log_files)} trace.log files: {trace_log_files}")
+
+                        for log_file in trace_log_files:
+                            log_file_path = os.path.join(self.fs_path, log_file)
+                            subtargets, subfolders, subconfigs, subip_addrs, subipv6_addrs, sub_ports, subinterfaces, subfailed, subfaulted, _ = sparser.parse(
+                                "", log_file_path, forkmap=forkmap)
+                            targets.update(subtargets)
+                            folders.update(subfolders)
+                            configs.update(subconfigs)
+                            # ip_addrs.update(subip_addrs)
+                            # ipv6_addrs.update(subipv6_addrs)
+                            # ports.update(sub_ports)
+                            interfaces.update(subinterfaces)
+                            failed.update(subfailed)
+                            if subfaulted:
+                                errored = True
+                                exit_code = -11
+                    else:
+                        print("No trace.log files found in trace_path")
+                except Exception as e:
+                    print(f"Error processing trace.log files: {str(e)}")
+            else:
+                print("Target application logs already exist, skipping processing of other trace.log files")
+                
+            parse_end_time = time.monotonic()
+            parse_duration = parse_end_time - parse_start_time
+            print(f"    - [Parsing Logs] Completed in {parse_duration:.2f} seconds")
                 
             print("exit_code " + str(exit_code) + "; timeout " +
                   str(timedout) + "; errored " + str(errored))
@@ -861,7 +1180,7 @@ class Greenhouse():
             #     self.changelog.append(sublog)
 
             ## check for different root dir
-            changed_cwd, bin_cwd = self.gh.check_cwd(self.fs_path, targets, bin_cwd, cwd_rh_replaced, success)
+            # changed_cwd, bin_cwd = self.gh.check_cwd(self.fs_path, targets, bin_cwd, cwd_rh_replaced, success)
 
             # check for new ip/interfaces/ports
             ip_addrs.update(ipv6_addrs) # we currently handle ipv4 and ipv6 the same way via HACKBIND
@@ -905,6 +1224,24 @@ class Greenhouse():
             print("    - ", changed_cwd)
             
             # check for success
+            # 如果 wellformed 为 True，直接结束托管
+            if wellformed:
+                success_msg = "Success, filesystem runs!"
+                rehost_result = "SUCCESS"
+                print(success_msg)
+
+                good_rh = firmae_success and self.rh_success and self.ps_success and self.cwd_success
+                print("firmae_success:", firmae_success, "self.rh_success:", self.rh_success, \
+                      "self.ps_success:", self.ps_success, "self.cwd_success:", self.cwd_success)
+                if success and wellformed and good_rh and os.path.exists(self.target_cache_path):
+                    # mark cached fullrehost result as good
+                    success_tag = os.path.join(self.target_cache_path, FIRMAE_TAG)
+                    print("    - tagging %s as a good fullrehost" % self.target_cache_path)
+                    # 不再创建空文件，因为FIRMAE_TAG已经在apply_fullsystem_rehost中创建并写入了详细信息
+                    # Files.touch_file(success_tag)
+
+                break
+            
             if (len(new_ips) == 0 and last_mac == mac and not changed_cwd and \
                 (self.partial_configs or len(configs) == 0 or configs == last_configs)):
                 if success and not needs_nodaemon_patch: # no obvious transplants left and success was reached
@@ -950,9 +1287,10 @@ class Greenhouse():
                           "self.ps_success:", self.ps_success, "self.cwd_success:", self.cwd_success)
                     if success and wellformed and good_rh and os.path.exists(self.target_cache_path):
                         # mark cached fullrehost result as good
-                        success_tag = os.path.join(self.target_cache_path, GH_SUCCESS_TAG)
+                        success_tag = os.path.join(self.target_cache_path, FIRMAE_TAG)
                         print("    - tagging %s as a good fullrehost" % self.target_cache_path)
-                        Files.touch_file(success_tag)
+                        # 不再创建空文件，因为FIRMAE_TAG已经在apply_fullsystem_rehost中创建并写入了详细信息
+                        # Files.touch_file(success_tag)
 
                     break
 
@@ -961,9 +1299,14 @@ class Greenhouse():
                 break
 
 
-            if self.max_cycles < 0 or count < self.max_cycles:
+            if max_cycles < 0 or count < max_cycles:
                 ## greenhouse targets
+                print("    - [Applying Fixes] Starting...")
+                fix_start_time = time.monotonic()
                 skipped = self.gh.transplant(self.fs_path, targets, folders, configs, failed, success, no_skip, self.hackdevproc, self.changelog)
+                fix_end_time = time.monotonic()
+                fix_duration = fix_end_time - fix_start_time
+                print(f"    - [Applying Fixes] Completed in {fix_duration:.2f} seconds")
                 mac = self.gh.get_mac_from_nvrams(self.fs_path)
                 nvram_ips = self.gh.get_ips_from_nvram()
                 new_ips = self.gh.parse_ips(self.ip_targets_path, nvram_ips, self.urls)
@@ -1008,7 +1351,7 @@ class Greenhouse():
                     return 0
 
             ## repeat until success, or no further Greenhouseing is possible / max cycles reached
-            if self.max_cycles >= 0 and count >= self.max_cycles:
+            if max_cycles >= 0 and count >= max_cycles:
                 print("[Greenhouse] !! MAX CYCLES %d REACHED !!" % count)
                 # 如果目标应用日志不存在且修复手段用完也没有潜在的修复点，就需要推测目标应用启动命令，尝试单应用启动
                 if not self.is_target_app:
@@ -1033,7 +1376,7 @@ class Greenhouse():
                     if self.extra_args.strip() != new_run_args.strip():
                         self.changelog.append("[ROADBLOCK] requires specific run time args")
                         self.changelog.append(pslog)
-                    self.extra_args = new_run_args
+                    self.extra_args = format_args_with_quotes(new_run_args)
                 if len(cwdpath) > 0:
                     cwdlog = "    - replacing bin_cwd" + bin_cwd + "with" + cwdpath
                     print(cwdlog)
@@ -1116,8 +1459,8 @@ class Greenhouse():
         self.write_changelog(self.changelog)
         # if self.batchfolder_path:
         #     Files.rm_files([trace_path, trace_json_path])
-        if self.output_dst_path and rehost_result != "FAILED":
-            output_dir = self.name
+        if self.output_dst_path:
+            output_dir = self.name + "_init"
             output_dir_path = os.path.join(self.output_dst_path, output_dir)
             print("."*50)
             print(" - copying modified fs to target directory: %s" % output_dir_path)
@@ -1166,17 +1509,13 @@ class Greenhouse():
             except Exception as e:
                 print(f" - error checking for logs: {str(e)}")
             
-            Files.rm_folder(self.workspace)
-            Files.mkdir(self.workspace)
-        else:
-            print("."*50)
-            print(" - Rehost Failed, skipping copying of fs")
-            print("."*50)
+            # Files.rm_folder(self.workspace)
+            # Files.mkdir(self.workspace)
         
         #exit
         print("="*50)
         print("[GREENHOUSE] RUN FINISH ", time.ctime())
-        totaltime = time.time() - starttime
+        totaltime = time.monotonic() - starttime
         print("[GREENHOUSE] TIME TAKEN = ", (totaltime / 60), "mins")
         print("[GREENHOUSE] REHOST STATUS - %s: %s" % (self.sha256hash, rehost_result))
         
@@ -1198,10 +1537,590 @@ class Greenhouse():
         print(f"    - Total Tokens: {self.total_input_tokens + self.total_output_tokens}")
         
         print("="*50)
-        if success and wellformed:
+        if wellformed:
             return 0
         return 1
 
+    ## patch loop
+    def patch_loop(self):
+        targets = set(".")
+        configs = set()
+        self.changelog = []
+        last_failed = set()
+        last_folders= set()
+        last_targets= set()
+        last_configs = set()
+        no_skip = []
+        failed = set()
+        targets = set()
+        configs = set()
+        folders = set()
+        interfaces = set()
+        bg_cmds = []
+        bin_paths = []
+        interface_cmds = []
+
+        self.urls = [self.docker_ip]
+        self.ports = self.ports_base.copy()
+
+        success = False
+        fullrehosted = False
+        greenhouse_mode = True
+        cwd_rh_replaced = False
+        firmae_success = False
+        success = False
+        wellformed = False
+        connected = False
+        rehost_result = "FAILED"
+        count = 0
+        bg_sleep = 1
+        binary = None
+        bin_cwd = "/"
+        mac = ""
+        last_mac = ""
+        nodaemon_args = ""
+        needs_dedaemon = False
+        needs_nodaemon_patch = False
+        testing_nodaemon_patch = False
+        nd_flags = ["-D", "-X", "-n", "-d"]
+        ndflag_index = 0
+        patch_blacklist = []
+        self.ip_targets_path = os.path.join(self.fs_path, "target_urls")
+        self.ports_path = os.path.join(self.fs_path, "target_ports")
+
+        if self.enable_dedaemon:
+            needs_dedaemon = True
+        else:
+            patch_blacklist = ["daemon_fork"]
+
+        print("[GREENHOUSE] RUNNING ", time.ctime())
+        starttime = time.monotonic()
+
+        checker = self.get_checker()
+        sparser = TraceParser(fs_path=self.fs_path)
+        patcher = Patcher(blacklist=patch_blacklist)
+        
+        self.runner = QemuRunner(self.fs_path, self.bin_path, self.init_path, self.qemu_arch+"_ori", self.sha256hash,
+                                 checker, changelog=self.changelog, docker_ip=self.docker_ip,
+                                 baseline_mode=self.baseline,
+                                 hackbind=self.hackbind,
+                                 hackdevproc=self.hackdevproc,
+                                 hacksysinfo=self.hacksysinfo,
+                                 api_key=self.api_key,
+                                 model=self.model)
+        
+        # setup ip targets
+        if not os.path.exists(self.ip_targets_path):
+            self.gh.parse_ips(self.ip_targets_path, self.urls)
+
+        # setup port targets
+        if not os.path.exists(self.ports_path):
+            self.gh.parse_ports(self.ports_path, self.ports)
+
+        if self.trunk_only:
+            greenhouse_mode = False
+
+        # setup background scripts
+        self.bg_scripts = self.get_background_plugins()
+
+        new_run_args = ""
+        if self.rehost_first and len(self.firmae_path) > 0:
+            print("###################### FULLREHOST ######################")
+            new_run_args, cwdpath, firmae_success = self.apply_fullsystem_rehost()
+            if firmae_success:
+                self.changelog.append("[ROADBLOCK] requires copying of full-system fs/nvram values/runtime args ")
+            if len(new_run_args) > 0:
+                pslog = "    - replacing runtime extra args " + self.extra_args + " with " + new_run_args
+                print(pslog)
+                if self.extra_args.strip() != new_run_args.strip():
+                    self.changelog.append("[ROADBLOCK] requires specific run time args")
+                    self.changelog.append(pslog)
+                self.extra_args = format_args_with_quotes(new_run_args)
+            if len(cwdpath) > 0:
+                cwdlog = "    - replacing bin_cwd " + bin_cwd + " with " + cwdpath
+                print(cwdlog)
+                if bin_cwd.strip() != cwdpath.strip():
+                    self.changelog.append("[ROADBLOCK] requires specified CWD for webserver binary")
+                    self.changelog.append(cwdlog)
+                    if firmae_success:
+                        cwd_rh_replaced = True
+                bin_cwd = cwdpath
+            fullrehosted = True
+        
+        if not fullrehosted or len(new_run_args) <= 0:
+            # check for command-line args like conf paths/flags
+            print("    - checking for cl_args...")
+            command_args = self.gh.setup_cl_args(self.brand, self.fs_path, self.bin_path, self.changelog, self.extra_args_base, self.rehost_type)
+            self.extra_args = self.extra_args_base
+            for arg in command_args:
+                if arg not in self.extra_args:
+                    self.extra_args += " %s" % arg
+        
+
+
+        if not self.baseline:
+            print("Extracting bg script commands...")
+            bin_paths = self.get_bin_paths()
+            for name, bg in self.bg_scripts.items():
+                cmds, sleeptime = bg.get_single_cmds(bin_paths, self.fs_path)
+                if len(cmds) > 0:
+                    print("    - using ", name)
+                    bg_cmds.extend(cmds)
+                    bg_sleep += sleeptime
+            print("...done!")
+
+        while True:
+            label = "###################### PATCH LOOP [%d] ######################" % count
+            self.write_changelog(self.changelog)
+            self.changelog.append(label)
+            print(label)
+            time_to_up = -1
+            count += 1
+            ## run target binary in docker via qemu-user
+            emulation_output, exit_code, timedout, trace_path, time_to_up = self.runner.run(timeout=self.timeout, bin_cwd=bin_cwd,
+                                                                            potential_urls=self.urls,
+                                                                            ports_file=self.ports_path,
+                                                                            extra_args=self.extra_args,
+                                                                            nd_args=nodaemon_args,
+                                                                            bg_cmds=bg_cmds,
+                                                                            bg_sleep=bg_sleep,
+                                                                            interface_cmds=interface_cmds,
+                                                                            mac=mac,
+                                                                            has_ipv6=has_ipv6,
+                                                                            greenhouse_mode=greenhouse_mode)
+            print("Exit code", exit_code, "timedout", timedout)
+
+            # generate program trace
+            trace_json_path = trace_path.rsplit(".", 1)[0] + ".json"
+            print("    - [Converting Trace] Starting...")
+            convert_start_time = time.monotonic()
+            parse_success = sparser.convert(trace_path, trace_json_path)
+            convert_end_time = time.monotonic()
+            convert_duration = convert_end_time - convert_start_time
+            print(f"    - [Converting Trace] Completed in {convert_duration:.2f} seconds")
+            if not parse_success:
+                print("    - failed to parse trace_path")
+                break
+            trace = Trace(trace_json_path)
+
+            errored = exit_code in self.runner.ERROR_CODES
+
+            # bintrunk mode only
+            if self.trunk_only:
+                self.generate_bintrunk(trace_json_path, trace, always_rebuild=True)
+                if self.batchfolder_path:
+                    Files.rm_files([trace_path, trace_json_path])
+                print("    - generate_bintrunk complete.")
+                break
+
+            last_mac = mac
+            last_failed = failed.copy()
+            last_targets = targets.copy()
+            last_configs = configs.copy()
+            last_folders = folders.copy()
+            forkmap = dict()
+            is_daemonized = False
+
+            ## gather filesystem and nvram targets
+            print("    - [Parsing Logs] Starting...")
+            parse_start_time = time.monotonic()
+            targets, folders, configs, ip_addrs, ipv6_addrs, ports, interfaces, failed, segfaulted, is_daemonized = sparser.parse(emulation_output, trace_path, forkmap=forkmap)
+            if segfaulted:
+                errored = True
+                exit_code = -11
+
+            # process subcall traces for missing files
+            subcount = 0
+            basetracepath = trace_path[:-1]
+            subpath = "%s%d" % (basetracepath, subcount)
+            print("Processing subtraces...")
+            while os.path.exists(subpath):
+                print(f"target log file found")
+                if subcount == 1:
+                    subcount += 1
+                    subpath = "%s%d" % (basetracepath, subcount)
+                    continue
+                subtargets, subfolders, subconfigs, subip_addrs, subipv6_addrs, sub_ports, subinterfaces, subfailed, subfaulted, _ = sparser.parse("", subpath, forkmap=forkmap)
+                targets.update(subtargets)
+                folders.update(subfolders)
+                configs.update(subconfigs)
+                ip_addrs.update(subip_addrs)
+                ipv6_addrs.update(subipv6_addrs)
+                ports.update(sub_ports)
+                interfaces.update(subinterfaces)
+                failed.update(subfailed)            
+                if subfaulted:
+                    errored = True
+                    exit_code = -11
+                # we don't need to track extra failed libs here
+                subcount += 1
+                subpath = "%s%d" % (basetracepath, subcount)
+                
+            parse_end_time = time.monotonic()
+            parse_duration = parse_end_time - parse_start_time
+            print(f"    - [Parsing Logs] Completed in {parse_duration:.2f} seconds")
+            print("exit_code", exit_code, "timeout", timedout, "errored", errored)
+            
+            print("    - [targets]: ")
+            print("    - ", targets)
+            print("    - [folders]: ")
+            print("    - ", folders)
+            print("    - [configs]: ")
+            print("    - ", configs)
+            print("    - [ip_addrs]: ")
+            print("    - ", ip_addrs)
+            print("    - [ipv6_addrs]: ")
+            print("    - ", ipv6_addrs)
+            print("    - [ports]: ")
+            print("    - ", ports)
+            print("    - [interfaces]: ")
+            print("    - ", interfaces)
+            print("    - [failed]: ")
+            print("    - ", failed)
+            print("    - [forkmap]: ")
+            print("    - ", forkmap)
+            
+            ## test for success
+            success = False
+            wellformed = False
+            connected = False
+            success, wellformed, connected = checker.check(exit_code, timedout, errored, self.strict)
+            print("  - [connected]:", connected)
+            print("  - [success]:", success)
+            print("  - [wellformed]:", wellformed)
+
+            # 如果 wellformed 为 True，直接结束托管
+            if wellformed:
+                success_msg = "Success, filesystem runs!"
+                rehost_result = "SUCCESS"
+                print(success_msg)
+
+                good_rh = firmae_success and self.rh_success and self.ps_success and self.cwd_success
+                print("firmae_success:", firmae_success, "self.rh_success:", self.rh_success, \
+                      "self.ps_success:", self.ps_success, "self.cwd_success:", self.cwd_success)
+                if success and wellformed and good_rh and os.path.exists(self.target_cache_path):
+                    # mark cached fullrehost result as good
+                    success_tag = os.path.join(self.target_cache_path, FIRMAE_TAG)
+                    print("    - tagging %s as a good fullrehost" % self.target_cache_path)
+                    # 不再创建空文件，因为FIRMAE_TAG已经在apply_fullsystem_rehost中创建并写入了详细信息
+                    # Files.touch_file(success_tag)
+
+                break
+
+            # check for threading/child procs
+            if subcount > 2:
+                self.changelog.append("[ROADBLOCK] requires multi-threading/child-processes to handle server response")
+                sublog = "    - %d subtargets" % (subcount-1)
+                self.changelog.append(sublog)
+
+            ## check for different root dir
+            changed_cwd, bin_cwd = self.gh.check_cwd(self.fs_path, targets, bin_cwd, cwd_rh_replaced, success)
+
+            # check for new ip/interfaces/ports
+            ip_addrs.update(ipv6_addrs) # we currently handle ipv4 and ipv6 the same way via HACKBIND
+            new_ips = self.gh.parse_ips(self.ip_targets_path, ip_addrs, self.urls)
+            self.urls.extend(list(new_ips))
+            new_ports = self.gh.parse_ports(self.ports_path, ports, self.ports)
+            self.ports.extend(list(new_ports))
+
+            # add new interfaces
+            urls_with_interfaces, interface_cmds = self.gh.add_interfaces(interfaces, self.urls)
+            new_ips += (set(urls_with_interfaces) - set(self.urls))
+            self.urls = urls_with_interfaces
+
+            # if daemon patch messes stuff up
+            if not success and needs_dedaemon and len(nodaemon_args) > 0:
+                if  ndflag_index < len(nd_flags):
+                    print("    - trying a different nodaemon flag...")
+                    nodaemon_args = nd_flags[ndflag_index]
+                    ndflag_index += 1
+                    count -= 1
+                else:
+                    print("    - nodaemon flag(s) cause issues, reverting...")
+                    needs_dedaemon = False
+                    nodaemon_args = ""
+                    count -= 1
+                continue
+
+            if not success and testing_nodaemon_patch:
+                print("    - nodaemon patch cause issues, reverting...")
+                binary.restoreCount(count-1)
+                testing_nodaemon_patch = False
+                count -= 1
+                continue
+
+
+            print("    - [new_ips]: ")
+            print("    - ", new_ips)
+            print("    - [new mac]: ")
+            print("    - ", last_mac == mac)
+            print("    - [changed_cwd]: ")
+            print("    - ", changed_cwd)
+            
+            # check for success
+            if (len(new_ips) == 0 and last_mac == mac and not changed_cwd and \
+                (self.partial_configs or len(configs) == 0 or configs == last_configs)):
+                if success and not needs_nodaemon_patch: # no obvious transplants left and success was reached
+                    if not greenhouse_mode:
+                        print("    - rehost done, rerunning in greenhouse mode to finalize...")
+                        greenhouse_mode = True
+                        continue
+
+                    # nodaemon flag guessing
+                    if needs_dedaemon and is_daemonized and ndflag_index < len(nd_flags):
+                        print("    - rehost done, trying to guess nodaemon flag...")
+                        nodaemon_args = nd_flags[ndflag_index]
+                        ndflag_index += 1
+                        count -= 1
+                        continue
+                    elif needs_dedaemon and not is_daemonized:
+                        print("    - nodaemon flag successful...")
+                        needs_dedaemon = False
+                    elif needs_dedaemon and ndflag_index == len(nd_flags):
+                        print("    - unable to find nodaemon flag, engaging patcher...")
+                        nodaemon_args = ""
+                        needs_dedaemon = False
+                        needs_nodaemon_patch = True
+                        patcher = Patcher(whitelist="daemon_fork")
+                        greenhouse_mode = False
+                        continue
+
+                    success_msg = "Success, filesystem runs!"
+                    rehost_result = "SUCCESS"
+                    if not wellformed:
+                        success_msg = "Partial " + success_msg
+                        rehost_result = "PARTIAL"
+                    print(success_msg)
+
+                    good_rh = firmae_success and self.rh_success and self.ps_success and self.cwd_success
+                    print("firmae_success:", firmae_success, "self.rh_success:", self.rh_success, \
+                          "self.ps_success:", self.ps_success, "self.cwd_success:", self.cwd_success)
+                    if success and wellformed and good_rh and os.path.exists(self.target_cache_path):
+                        # mark cached fullrehost result as good
+                        success_tag = os.path.join(self.target_cache_path, FIRMAE_TAG)
+                        print("    - tagging %s as a good fullrehost" % self.target_cache_path)
+                        # 不再创建空文件，因为FIRMAE_TAG已经在apply_fullsystem_rehost中创建并写入了详细信息
+                        # Files.touch_file(success_tag)
+
+                    break
+
+            if self.baseline:
+                print("    - baseline run complete.")
+                break
+
+
+            if greenhouse_mode and (self.max_cycles < 0 or count < self.max_cycles):
+                ## greenhouse targets
+                print("    - [Applying Fixes] Starting...")
+                fix_start_time = time.monotonic()
+                skipped = self.gh.transplant(self.fs_path, targets, folders, configs, failed, success, no_skip, self.hackdevproc, self.changelog)
+                fix_end_time = time.monotonic()
+                fix_duration = fix_end_time - fix_start_time
+                print(f"    - [Applying Fixes] Completed in {fix_duration:.2f} seconds")
+                mac = self.gh.get_mac_from_nvrams(self.fs_path)
+                nvram_ips = self.gh.get_ips_from_nvram()
+                new_ips = self.gh.parse_ips(self.ip_targets_path, nvram_ips, self.urls)
+                self.urls.extend(list(new_ips))
+
+                ## repeat until no targets left or success reached
+                # no further transplants possible
+                if len(targets) == 0 and len(folders) == 0 and len(configs) == 0 and len(new_ips) == 0 and last_mac == mac and not changed_cwd:
+                    # no transplants left but no success, engage patching
+                    print("    - no transplants left to try, engage patching")
+                    if greenhouse_mode or self.repeat:
+                        greenhouse_mode = False
+                        print("    - rerunning...")
+                        continue # repeat with flag set
+                    else:
+                        # already in patch mode or not meant to repeat, end
+                        print("    - cycle complete...")
+                        return 0
+
+                # break out of infinite greenhouse loop in case where greenhousing does not seem to change anything
+                if not changed_cwd and last_mac == mac and len(new_ips) == 0: # no ips or cwd changes
+                    if targets == last_targets and last_folders == folders and \
+                       last_failed == failed and last_configs == configs: #attempted fs fixing failed, skip and continue anywayz
+                        print("    - no change in failed cases despite greenhousing, skip to patching")
+                        if greenhouse_mode or self.repeat:
+                            greenhouse_mode = False
+                            print("    - rerunning...")
+                            continue # repeat with flag set
+                        else:
+                            # already in patch mode or not meant to repeat, end
+                            print("    - cycle complete...")
+                            return 0
+
+                # further transplants possible, keep greenhousing
+                if self.repeat:
+                    print("    - rerunning...")
+                    continue # otherwise keep greenhousing
+                else:
+                    print("    - cycle complete...")
+                    return 0
+
+            ## repeat until success, or no further Greenhouseing is possible / max cycles reached
+            if self.max_cycles >= 0 and count >= self.max_cycles:
+                print("[Greenhouse] !! MAX CYCLES %d REACHED !!" % count)
+                if connected and not wellformed:
+                    rehost_result = "PARTIAL"
+                if self.batchfolder_path:
+                    Files.rm_files([trace_path, trace_json_path])
+                break
+
+            ## first, try to obtain more configs from fullrehosting
+            if not success and not fullrehosted and len(self.firmae_path) > 0:
+                print("Attempting a fullrehost to fix issues...")
+                new_run_args, cwdpath, firmae_success = self.apply_fullsystem_rehost()
+                if firmae_success:
+                    self.changelog.append("[ROADBLOCK] requires copying of full-system fs/nvram values/runtime args ")
+                if len(new_run_args) > 0:
+                    pslog = "    - replacing runtime extra args " + self.extra_args + " with " + new_run_args
+                    print(pslog)
+                    if self.extra_args.strip() != new_run_args.strip():
+                        self.changelog.append("[ROADBLOCK] requires specific run time args")
+                        self.changelog.append(pslog)
+                    self.extra_args = format_args_with_quotes(new_run_args)
+                else:
+                    # Infer target app startup command using StartupCommandServer if fullrehost didn't provide args
+                    print("    - inferring target app startup command...")
+                    from backend.LLMServer import StartupCommandServer
+                    try:
+                        startup_server = StartupCommandServer(self.fs_path, self.bin_path, self.qemu_arch, "", self.api_key)
+                        # Pass FirmAE-provided information if available
+                        firmae_info = {}
+                        
+                        print(f"    - using FirmAE info for inference: {firmae_info}")
+                        inferred_startup_cmd = startup_server.get_target_app_startup([], firmae_info=firmae_info)
+                        if inferred_startup_cmd:
+                            print(f"    - inferred startup command: {inferred_startup_cmd}")
+                            # Split the inferred command into binary path and extra args
+                            # Assuming the command format is: /path/to/binary [args]
+                            cmd_parts = inferred_startup_cmd.split()
+                            if len(cmd_parts) > 0:
+                                # If the first part is a different binary path, ignore it (we want to use self.bin_path)
+                                # Only take the args part
+                                if len(cmd_parts) > 1:
+                                    # 直接处理 cmd_parts，保留原始的参数结构
+                                    # 第一个元素是二进制路径，后面的是参数
+                                    args = cmd_parts[1:]
+                                    # 使用封装好的函数处理参数值的引号
+                                    args_str = " ".join(args)
+                                    self.extra_args = format_args_with_quotes(args_str)
+                                    print(f"    - set extra_args to: {self.extra_args}")
+                            else:
+                                # 如果没有参数，清空 extra_args
+                                self.extra_args = ""
+                                print("    - no args inferred, cleared extra_args")
+                    except Exception as e:
+                        print(f"    - error inferring startup command: {e}")
+                        # Continue with existing logic if inference fails
+                if len(cwdpath) > 0:
+                    cwdlog = "    - replacing bin_cwd" + bin_cwd + "with" + cwdpath
+                    print(cwdlog)
+                    if bin_cwd.strip() != cwdpath.strip():
+                        self.changelog.append("[ROADBLOCK] requires specified CWD for webserver binary")
+                        self.changelog.append(cwdlog)
+                        if firmae_success:
+                            cwd_rh_replaced = True
+                    bin_cwd = cwdpath
+                success = False
+                greenhouse_mode = True
+                fullrehosted = True
+                print("    - rerunning...")
+                continue
+
+            ## if no targets left and success not reached, attempt patch
+            ## generate bintrunk of target binary
+            trace_trunk_path, index = self.generate_bintrunk(trace_json_path, trace, always_rebuild=True)
+
+
+            if not binary is None:
+                binary.close()
+            binary = Binary(self.bin_path, trace.base_addr, count=count)
+
+            ## determine type of patch needed
+            ## 1) patch out a wait loop
+            ## 2) dodge an exit
+            ## 3) patch out a crashing instruction/exit jump
+            ## perform appropriate patch
+            print("    - [Patching] Starting...")
+            patch_start_time = time.monotonic()
+            if len(trace_trunk_path) <= 0 or \
+                not patcher.diagnose_and_patch(binary, self.bintrunk, trace, trace_trunk_path, index, exit_code, \
+                                              timedout, errored, is_daemonized, skip=self.diagnose_only, changelog=self.changelog):
+                if needs_nodaemon_patch:
+                    # revert
+                    print("    - unable to patch daemon call, reverting...")
+                    greenhouse_mode = True
+                    needs_nodaemon_patch = False
+                    count -= 1
+                    continue
+                else:
+                    # unable to patch
+                    print("No patch successful")
+                    self.changelog.append("[Greenhouse] No patch successful")
+                    if self.batchfolder_path:
+                        Files.rm_files([trace_path, trace_json_path])
+                    break
+            patch_end_time = time.monotonic()
+            patch_duration = patch_end_time - patch_start_time
+            print(f"    - [Patching] Completed in {patch_duration:.2f} seconds")
+
+            ## rerun outer loop, including checking for new files and nvrams
+            greenhouse_mode = True
+            if needs_nodaemon_patch:
+                testing_nodaemon_patch = True
+                needs_nodaemon_patch = False
+
+            if self.repeat:
+                print("    - rerunning...")
+                continue
+            else:
+                if self.batchfolder_path:
+                    Files.rm_files([trace_path, trace_json_path])
+                print("    - cycle complete...")
+                return 0
+
+        print("[Greenhouse] Rehosting Complete, exiting...")
+
+        if connected and not wellformed:
+            rehost_result = "PARTIAL"
+
+        self.write_changelog(self.changelog)
+        if self.batchfolder_path:
+            Files.rm_files([trace_path, trace_json_path])
+        if self.output_dst_path:
+            output_dir = self.name + "_noinit"
+            output_dir_path = os.path.join(self.output_dst_path, output_dir)
+            print("."*50)
+            print(" - copying modified fs to target directory: %s" % output_dir_path)
+            print("."*50)
+            self.runner.export_current_dockerfs(output_dir_path, result=rehost_result, name=output_dir, brand=self.brand, hash=self.sha256hash, \
+                                                checker=checker, external_qemu=self.external_qemu, urls=self.urls, time_to_up=time_to_up)
+            Files.rm_folder(self.workspace)
+            Files.mkdir(self.workspace)
+        
+        #exit
+        print("="*50)
+        print("[GREENHOUSE] RUN FINISH ", time.ctime())
+        totaltime = time.monotonic() - starttime
+        print("[GREENHOUSE] TIME TAKEN = ", (totaltime / 60), "mins")
+        print("[GREENHOUSE] REHOST STATUS - %s: %s" % (self.sha256hash, rehost_result))
+        
+        # 累计token统计
+        if hasattr(self, 'runner') and self.runner:
+            token_stats = self.runner.get_token_stats()
+            self.total_input_tokens += token_stats['input_tokens']
+            self.total_output_tokens += token_stats['output_tokens']
+            print("[TOKEN STATISTICS] Total Usage Across All Rounds:")
+            print(f"    - Total Input Tokens: {self.total_input_tokens}")
+            print(f"    - Total Output Tokens: {self.total_output_tokens}")
+            print(f"    - Total Tokens: {self.total_input_tokens + self.total_output_tokens}")
+        
+        print("="*50)
+        if success and wellformed:
+            return 0
+        return 1
 
 def main():
     parser = argparse.ArgumentParser(description='given an firmware image and target, generate and patch a runnable instance of the firmware')
@@ -1222,8 +2141,10 @@ def main():
     
     parser.add_argument('--api_key', default="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5",
                     help='LLM api key')
-    parser.add_argument('--model', default="qwen3-max",
+    parser.add_argument('--model', default="deepseek-v3.2",
                     help='LLM model')
+    parser.add_argument('--no_services', action="store_true", default=True,
+                    help='disable all services (NvramServer, StartupCommandServer, ContainerPsMonitor, InitServer)')
 
     parser.add_argument('--target_bin', default="",
                     help='path to the target binary (manual override)')
@@ -1231,11 +2152,11 @@ def main():
                     help='additional arguments to pass to the binary (manual override)')
     
     # Disable specific mechanisms
-    parser.add_argument('--no_extra_args', action="store_true", default=True,
+    parser.add_argument('--no_extra_args', action="store_true", default=False,
                     help='disable extra args mechanism - use only the provided bin_args')
     parser.add_argument('--no_bg_scripts', action="store_true", default=False,
                     help='disable background scripts mechanism')
-    parser.add_argument('--no_bintrunk', action="store_true", default=True,
+    parser.add_argument('--no_bintrunk', action="store_true", default=False,
                     help='disable bintrunk related services to avoid errors when missing required information')
     parser.add_argument('--nopatch', action="store_true", default=True,
                         help='disable all patching and diagnosis.')
@@ -1280,9 +2201,9 @@ def main():
                         help='disable full rehosting')
     parser.add_argument('-nr', '--norepeat', action="store_true", default=False,
                         help='run patch loop until success or no patch possible. Otherwise, patch loop only runs once')
-    parser.add_argument('-ns', '--nostrict', action="store_true", default=False,
+    parser.add_argument('-ns', '--nostrict', action="store_true", default=True,
                         help='strict patching - keep trying until HTTP return code is 200 and well-formed')
-    parser.add_argument('-nd', '--nodedaemon', action="store_true", default=True,
+    parser.add_argument('-nd', '--nodedaemon', action="store_true", default=False,
                         help='disable dedaemoning attempts after a successful rehost is done')
     parser.add_argument('-nb', '--nohack_bind', action="store_true", default=False,
                         help='disables hack bind')
@@ -1290,7 +2211,7 @@ def main():
                         help='disables hack dev and proc')
     parser.add_argument('-ni', '--nohack_sysinfo', action="store_true", default=False,
                         help='disables hack sysinfo')
-    parser.add_argument('-nc', '--nocleanupfirmae', action="store_true", default=False,
+    parser.add_argument('-nc', '--nocleanupfirmae', action="store_true", default=True,
                         help='disable cleanup after each fullrehosting attempt')
 
     args, unknownargs = parser.parse_known_args()

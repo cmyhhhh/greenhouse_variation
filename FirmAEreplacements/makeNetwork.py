@@ -735,6 +735,9 @@ def process(iid, arch, endianness, makeQemuCmd=False, outfile=None):
 
                 if (os.path.exists(SCRATCHDIR + '/' + str(iid) + '/web') and
                     open(SCRATCHDIR + '/' + str(iid) + '/web').read().strip() == 'true'):
+                    # 保存成功的 init 命令到 /FirmAEInit
+                    with open('/FirmAEInit', 'w') as f:
+                        f.write(init)
                     success = True
                     break
 

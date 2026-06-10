@@ -20,20 +20,22 @@ function cleanup()
 
 trap cleanup SIGINT
 
-mkdir -p k8/logs
-mkdir -p k8/results
-mkdir -p k8/patches
-mkdir -p k8/done
-mkdir -p k8/retries
+# mkdir -p k8/logs
+# mkdir -p k8/results
+# mkdir -p k8/patches
+# mkdir -p k8/done
+# mkdir -p k8/retries
 
 # eval $(minikube docker-env) && make release
 
-eval $(minikube docker-env) && docker pull capysix/greenhouse-ae:latest && docker tag capysix/greenhouse-ae:latest greenhouse:usenix-eval-jul2023
+# eval $(minikube docker-env) && docker pull capysix/greenhouse-ae:latest && docker tag capysix/greenhouse-ae:latest greenhouse:usenix-eval-jul2023
 
 echo "getting sudo for dev_cleanup"
 sudo echo "...done"
 
-minikube mount k8:/shared &
+# minikube mount k8:/shared &
 
-./docker_cleanup.sh &
-sudo ./dev_cleanup.sh
+nohup ./cleanup_zombie_pods.sh &
+nohup python3 ./host_llm_server.py &
+nohup ./docker_cleanup.sh &
+nohup sudo ./dev_cleanup.sh &

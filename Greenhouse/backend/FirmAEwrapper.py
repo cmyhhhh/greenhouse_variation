@@ -13,6 +13,7 @@ import psutil
 import datetime
 import psutil
 import pwn
+import shutil
 
 TARGET_FS = b"targetfs"
 TMPFS = b"tmpfs"
@@ -67,73 +68,139 @@ class FirmAEwrapper:
         firmae_cmd.extend(SUDO_CMD)
         firmae_cmd.extend([firmae_run, "-d", target_type, target_path])
         print("Running", firmae_cmd)
-        start = time.time()
+        start = time.monotonic()
         print("    - time: ", datetime.datetime.now())
 
         r = subprocess.Popen(firmae_cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
         os.chdir(curr_dir)
         firmaedbg_up = False
         run_telnet = False
+        check_web = False
         success = False
         telnet_up = False
-        initialized = False
+        check_web_complete = False
+        debug_telnet = False
         has_web = False
-        start_time = 0
-        initialized_time = 0
+        start_time = time.monotonic()
+        check_web_time = 0
         bgcmds = []
-        TIMEOUT = 3600 # seconds, should not take over an hour
-
+        CHECK_WEB_TIMEOUT = 3000
+        OVERALL_TIMEOUT = 3200
+        # CHECK_WEB_TIMEOUT = 1000
+        # OVERALL_TIMEOUT = 1200
+        
         while True:
             try:
-                output = r.stdout.readline()
-                if output == b'' and r.poll() is not None:
-                    print("Firmae Exited")
+                # 检查总运行时间限制
+                if time.monotonic() - start_time > OVERALL_TIMEOUT:
+                    print("Overall runtime OVERALL_TIMEOUT, terminating FirmAE...")
+                    # 尝试使用 socat_and_save 保存状态
+                    if IID:
+                        print("Attempting to save state using socat_and_save...")
+                        success = self.socat_and_save(IID, bgcmds)
+                    r.terminate()
+                    try:
+                        r.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        r.kill()
+                    print("FirmAE terminated due to timeout")
                     break
-                if initialized_time != 0:
-                    time_passed = time.time() - initialized_time
-                    if time_passed > TIMEOUT:
-                        print("Initialization TIMEOUT, attempt to connect anyway...")
-                        run_telnet = True
-                if output:
-                    print(output.strip())
-                    if b'FirmAE IID:' in output:
-                        IID = output.split(b":")[1].strip()
-                        IID = IID.decode("utf-8").strip()
-                    if b"Web service on" in output:
-                        has_web = True
-                    if b"infer network start!!!" in output:
-                        # get binary list and bgcmds
-                        if IID != "":
-                            fileList = []
-                            binListPath = os.path.join(self.firmae_path, "scratch", IID, "fileList")
-                            if os.path.exists(binListPath):
-                                print("    - setting up bg script data using fileList", binListPath)
-                                with open(binListPath, "r") as listFile:
-                                    for line in listFile:
-                                        fileList.append(line.strip())
-                                listFile.close()
-                                for name, bg in self.bg_scripts.items():
-                                    cmds = bg.get_fullsystem_cmds(fileList, TMPFS.decode('utf-8'))
-                                    if len(cmds) > 0:
-                                        print("    - [+] using", name)
-                                    bgcmds.extend(cmds)
-                                print("    - done!")
-                                print(b"continue inferring network...")
-                                start_time = time.time()
-                                time.sleep(10)
+                
+                # 使用select读取子进程输出，设置1秒超时，确保总运行时间检查能定期执行
+                ready, _, _ = select.select([r.stdout], [], [], 1.0)
+                
+                if ready:
+                    output = r.stdout.readline()
+                    if output == b'' and r.poll() is not None:
+                        print("Firmae Exited")
+                        break
+                    if output:
+                        print(output.strip())
+                        if b'FirmAE IID:' in output:
+                            IID = output.split(b":")[1].strip()
+                            IID = IID.decode("utf-8").strip()
+                        if b"Web service on" in output:
+                            has_web = True
+                        if b"infer network start!!!" in output:
+                            # get binary list and bgcmds
+                            if IID != "":
+                                fileList = []
+                                binListPath = os.path.join(self.firmae_path, "scratch", IID, "fileList")
+                                if os.path.exists(binListPath):
+                                    print("    - setting up bg script data using fileList", binListPath)
+                                    with open(binListPath, "r") as listFile:
+                                        for line in listFile:
+                                            fileList.append(line.strip())
+                                    listFile.close()
+                                    for name, bg in self.bg_scripts.items():
+                                        cmds = bg.get_fullsystem_cmds(fileList, TMPFS.decode('utf-8'))
+                                        if len(cmds) > 0:
+                                            print("    - [+] using", name)
+                                        bgcmds.extend(cmds)
+                                    print("    - done!")
+                                    print(b"continue inferring network...")
+                                    time.sleep(10)
+                                    continue
+                        if b"connecting to netcat" in output:
+                            addrport = output.split(b"(")[1].strip().strip(b")")
+                            array = addrport.split(b":")
+                            self.addr = array[0].strip()
+                        if b'6. exit' in output:
+                            run_telnet = True
+                            debug_telnet = True
+                        if b'Using Greenhouse-style HTTP checker' in output:
+                            # 记录检查web开始时间
+                            if check_web_time == 0:
+                                check_web_time = time.monotonic()
+                        if b'Greenhouse-style HTTP checker result' in output:
+                            check_web_complete = True
+                        if run_telnet:
+                            if not check_web_complete:
+                                self.firmae_check_web(IID)
+                                time.sleep(1)
+                                check_web_complete = True
+                            if debug_telnet:
+                                # setup shell for telnet
+                                print("Setting up telnet")
+                                r.stdin.write(b"2\n")
+                                r.stdin.flush()
+                                time.sleep(1)
+                                r.stdin.write(b"exit\n")
+                                r.stdin.flush()
+                                time.sleep(1)
+                                telnet_up = True
                                 continue
-                    if b"connecting to netcat" in output:
-                        addrport = output.split(b"(")[1].strip().strip(b")")
-                        array = addrport.split(b":")
-                        self.addr = array[0].strip()
-                    if b'6. exit' in output:
-                        run_telnet = True
-                    if firmaedbg_up and run_telnet:
-                        if not initialized:
-                            self.firmae_initialize()
+                            if check_web_complete: # and telnet_up:
+                                # connect to firmae using own script
+                                print("Connecting to emulation")
+                                time_passed = (time.monotonic() - start_time) / 60 # mins
+                                print("    - time taken since started inferring: %smins" % time_passed)
+                                success = False
+                                if telnet_up:
+                                    success = self.connect_and_save(self.addr, self.port, bgcmds)
+                                if not success:
+                                    success = self.socat_and_save(IID, bgcmds)
+                                    time.sleep(1)
+                                r.stdin.write(b"6\n")
+                                r.stdin.flush()
+                                r.stdout.flush()
+                                telnet_up = False
+                                self.check_shutdown()
+                                print("Firmae Done")
+                                break
+                else:
+                    # 没有输出，检查进程是否仍在运行
+                    if r.poll() is not None:
+                        print("Firmae Exited")
+                        break
+                    time_passed = time.monotonic() - start_time
+                    if time_passed > CHECK_WEB_TIMEOUT:
+                        print("Check web CHECK_WEB_TIMEOUT, attempt to connect anyway...")
+                        if not check_web_complete:
+                            self.firmae_check_web(IID)
                             time.sleep(1)
-                            initialized = True
-                        if not telnet_up:
+                            check_web_complete = True
+                        if debug_telnet:
                             # setup shell for telnet
                             print("Setting up telnet")
                             r.stdin.write(b"2\n")
@@ -144,10 +211,10 @@ class FirmAEwrapper:
                             time.sleep(1)
                             telnet_up = True
                             continue
-                        if initialized: # and telnet_up:
+                        if check_web_complete: # and telnet_up:
                             # connect to firmae using own script
                             print("Connecting to emulation")
-                            time_passed = (time.time() - start_time) / 60 # mins
+                            time_passed = (time.monotonic() - start_time) / 60 # mins
                             print("    - time taken since started inferring: %smins" % time_passed)
                             success = False
                             if telnet_up:
@@ -162,15 +229,20 @@ class FirmAEwrapper:
                             self.check_shutdown()
                             print("Firmae Done")
                             break
-                    if b'FirmAE Debugger' in output:
-                        firmaedbg_up = True
+                        
             except Exception as e:
                 print(e)
                 break
         
+        if has_web:
+            current_init = os.path.join(self.firmae_path, "scratch", IID, "current_init")
+            dest = "/current_init"
+            if os.path.exists(current_init):
+                shutil.copy(current_init, dest)
+        
         print("Run FirmAE complete")
         print("    - time: ", datetime.datetime.now())
-        end = time.time()
+        end = time.monotonic()
         print("    - duration: ", end - start)
         return IID, success, has_web
 
@@ -466,17 +538,49 @@ class FirmAEwrapper:
         tn.close()
         return success
 
-    def firmae_initialize(self):
-        old_environ = os.environ['PATH']
-        os.environ['PATH'] = self.analysis_path + ':' + os.environ['PATH']
-        init_script = os.path.join(self.firmae_path, "analyses", "initializer.py")
-        init_cmd = ([init_script, self.brand, self.addr])
+    def firmae_check_web(self, IID):
         print("-"*50)
-        print("Initializing...")
-        subprocess.run(init_cmd, timeout=3600)
-        print("done.")
+        print("[FirmAE] Checking web...")
+        # Use Greenhouse-style HTTP checker
+        greenhouse_checker = os.path.join(self.firmae_path, "scripts", "greenhouse_checker.py")
+        if os.path.exists(greenhouse_checker) and os.access(greenhouse_checker, os.X_OK):
+            print("[FirmAE] [*] Using Greenhouse-style HTTP checker")
+            # Read IP from file like in run.sh: IP=`cat ${WORK_DIR}/ip`
+            ips_str = ""
+            if IID:
+                work_dir = os.path.join(self.firmae_path, "scratch", IID)
+                ip_file = os.path.join(work_dir, "ip")
+                if os.path.exists(ip_file):
+                    try:
+                        with open(ip_file, 'r') as f:
+                            ips_str = f.read().strip()
+                        print(f"[FirmAE] [*] Read IP from file: {ips_str}")
+                    except Exception as e:
+                        print(f"[FirmAE] [*] Error reading IP file: {e}")
+            
+            # If IP not found, exit web access logic
+            if not ips_str:
+                print("[FirmAE] [*] No IP address found, skipping web access logic")
+                print("[FirmAE] done.")
+                print("-"*50)
+                return
+            
+            print(f"[FirmAE] [*] IPs: {ips_str}")
+            # Call greenhouse_checker.py with correct parameters
+            result = subprocess.run(["python3", greenhouse_checker, self.brand, "/tmp", ips_str], 
+                                   capture_output=True, text=True, timeout=300)
+            print(f"[FirmAE] [*] Greenhouse-style HTTP checker raw result: {result.stdout}")
+            if result.stdout:
+                last_line = result.stdout.strip().split('\n')[-1]
+                parts = last_line.split()
+                if len(parts) >= 5:
+                    ret_ip, connect_result, wellformed_result, connect_time, wellformed_time = parts
+                    print(f"[FirmAE] [*] Greenhouse-style HTTP checker result: {ret_ip} {connect_result} {wellformed_result} {connect_time} {wellformed_time}")
+                    # Update self.addr if needed
+                    if ret_ip:
+                        self.addr = ret_ip.encode('utf-8')
+        print("[FirmAE] done.")
         print("-"*50)
-        os.environ['PATH'] = old_environ
 
     def clear_firmware_cache(self):
         cache_path = os.path.join(self.firmae_path, "scratch")
@@ -629,7 +733,7 @@ class FirmAEwrapper:
 
 
     def extract_lognvram(self, qemu_serial_logpath, ):
-        print("         # parsing %s for nvram values" % qemu_serial_logpath)
+        print("         - parsing %s for nvram values" % qemu_serial_logpath)
         nvram_tags = set()
         nvram_map = dict()
 
@@ -676,5 +780,5 @@ class FirmAEwrapper:
                             print("Unable to parse nvram value for line:", line)
         qemuFile.close()
 
-        print("         # nvram extraction complete")
+        print("         - nvram extraction complete")
         return nvram_map

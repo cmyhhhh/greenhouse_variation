@@ -9,7 +9,11 @@ docker-compose version 1.29.2, build 5becea4c
 
 2) Once the image is loaded, make sure to start the container in privileged mode with /dev mounted
 
-`docker run -it --privileged -v /dev:/host/dev greenhouse:usenix-eval-jul2023 bash`
+`docker run -it --privileged -v /dev:/host/dev greenhouse_llm_all:v17 bash`
+`docker run -it --privileged -v /dev:/host/dev greenhouse_llm_all:v2 tail -f /dev/null`
+`docker exec -it dreamy_lewin bash`
+
+docker run -it --privileged -v /dev:/host/dev greenhouse_check_nvram:v1 bash
 
 3) Setup the runtime environment from the command line inside the container
 

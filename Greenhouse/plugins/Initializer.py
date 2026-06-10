@@ -57,10 +57,12 @@ class WebCheck:
         options.add_argument('--headless')
         options.add_argument('--no-sandbox')
         options.add_argument('--screen-size=1200x600')
-        options.set_capability('unhandledPromptBehaviour', 'dismiss')
-        options.set_capability('unexpectedAlertBehaviour', 'dismiss')
-        self.driver = webdriver.Chrome(options=options)
-        self.driver.set_page_load_timeout(60)
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-dev-shm-usage')
+        chromedriver_path = "/gh/chromedriver"
+        service = Service(executable_path=chromedriver_path)
+        self.driver = webdriver.Chrome(service=service, options=options)
+        self.driver.set_page_load_timeout(120)
         try:
             if ":" in auth:
                 index = url.index("://")

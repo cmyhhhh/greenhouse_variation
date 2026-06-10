@@ -14,6 +14,8 @@ from collections import defaultdict
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError, BadRequestError
 import sys
 import glob
+from queue import Queue
+from . import *
 
 # LLM请求锁文件前缀
 LLM_LOCK_PREFIX = "/tmp/llm_request_"
@@ -46,10 +48,12 @@ class ReverseClient:
         Raises:
             Exception: 连接或传输错误
         """
-        filename = os.path.basename(binary_path)
-        filesize = os.path.getsize(binary_path)
 
         try:
+            # 获取文件名和文件大小
+            filename = os.path.basename(binary_path)
+            filesize = os.path.getsize(binary_path)
+            
             # 连接服务器
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((self.host, self.port))
@@ -247,8 +251,54 @@ class ReverseClient:
         import shutil
         import concurrent.futures
 
+
+
+        # if self.fs_path:
+        #     print(f"[ReverseClient] Local reverse analysis for: {binary_path} ({self.fs_path})")
+        #     # 检查并解析符号链接，确保使用实际文件路径
+        #     resolved_path = binary_path
+        #     max_resolve_attempts = 10  # 防止循环软连接
+        #     attempt = 0
+            
+        #     while os.path.islink(resolved_path) and attempt < max_resolve_attempts:
+        #         attempt += 1
+        #         link_target = os.readlink(resolved_path)
+        #         link_target_in_fs = link_target.lstrip("/")
+        #         resolved_path = os.path.join(self.fs_path, link_target_in_fs)
+        #         resolved_path = os.path.normpath(resolved_path)
+            
+        #     if attempt >= max_resolve_attempts:
+        #         print(f"[ReverseClient] Too many symlink resolution attempts, possible circular symlink: {binary_path}")
+        #         return
+            
+        #     # 如果软连接到的真实文件已经被逆向完（查看/tmp下是否存在同名文件夹），则直接将逆向后的文件复制过去
+        #     resolved_reverse_name = f"{os.path.basename(resolved_path)}_decompile"
+        #     reverse_name = os.path.basename(reverse_dir)
+        #     parent_dir = os.path.dirname(reverse_dir)  # /tmp
+        #     existing_target_dir = os.path.join(parent_dir, resolved_reverse_name)
+        #     if os.path.isdir(existing_target_dir) and existing_target_dir != reverse_dir:
+        #         # 确保目标目录存在
+        #         if not os.path.exists(reverse_dir):
+        #             os.makedirs(reverse_dir, exist_ok=True)
+        #         # 如果/tmp下已存在同名文件夹，则将其内容复制到当前reverse_dir
+        #         try:
+        #             for item in os.listdir(existing_target_dir):
+        #                 src_path = os.path.join(existing_target_dir, item)
+        #                 dst_path = os.path.join(reverse_dir, item)
+        #                 if os.path.isfile(src_path):
+        #                     shutil.copy2(src_path, dst_path)
+        #                 elif os.path.isdir(src_path):
+        #                     if os.path.exists(dst_path):
+        #                         shutil.rmtree(dst_path)
+        #                     shutil.copytree(src_path, dst_path)
+        #             print(f"[ReverseClient] Copied reverse analysis results from {existing_target_dir} to {reverse_dir}")
+                    
+        #         except Exception as e:
+        #             print(f"[ReverseClient] Error copying reverse analysis results: {e}")
+        #         return
+            
         filename = os.path.basename(binary_path)
-        total_start_time = time.time()
+        total_start_time = time.monotonic()
 
         try:
             # 检查是否存在同名.i64文件，若存在则复用，否则生成
@@ -279,7 +329,7 @@ class ReverseClient:
                 decompile_functions = f.read().splitlines()
 
             # 将函数列表分成 num_groups 组
-            num_groups = 10
+            num_groups = 1  # 修改为2个脚本，支持多线程
             filtered_functions = [
                 func_name for func_name in decompile_functions if not func_name.startswith('.')]
             group_size = len(filtered_functions) // num_groups
@@ -319,11 +369,25 @@ class ReverseClient:
             print(f"[ReverseClient]    - Starting parallel execution of {len(scripts)} scripts...")
             results = []
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            def execute_script(script):
+                """执行脚本"""
+                import subprocess
+                
+                # 启动脚本进程
+                process = subprocess.Popen(["/bin/sh", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                
+                # 读取输出
+                stdout, stderr = process.communicate()
+                return {
+                    'returncode': process.returncode,
+                    'stdout': stdout,
+                    'stderr': stderr
+                }
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_groups) as executor:
                 future_to_script = {}
                 for script in scripts:
-                    future = executor.submit(
-                        subprocess.run, ["/bin/sh", script], capture_output=True, text=True)
+                    future = executor.submit(execute_script, script)
                     future_to_script[future] = script
 
                 for future in concurrent.futures.as_completed(future_to_script):
@@ -331,17 +395,17 @@ class ReverseClient:
                     try:
                         result = future.result()
                         results.append(result)
-                        if result.returncode == 0:
+                        if result['returncode'] == 0:
                             print(
-                                f"[ReverseClient]    - 脚本执行完成: {os.path.basename(script)} (返回码: {result.returncode})")
+                                f"[ReverseClient]    - 脚本执行完成: {os.path.basename(script)} (返回码: {result['returncode']})")
                         else:
                             print(
-                                f"[ReverseClient]    - 脚本执行完成: {os.path.basename(script)} (返回码: {result.returncode}) - 部分函数反编译失败!")
+                                f"[ReverseClient]    - 脚本执行完成: {os.path.basename(script)} (返回码: {result['returncode']}) - 部分函数反编译失败!")
                     except Exception as e:
                         print(f"[ReverseClient]    - Script execution error: {os.path.basename(script)} - {e}")
 
             # 总时间结束
-            total_end_time = time.time()
+            total_end_time = time.monotonic()
             total_duration = total_end_time - total_start_time
             print(f"[ReverseClient] Reverse analysis completed: {filename}")
             print(f"[ReverseClient] Total time consumed: {total_duration:.2f} seconds")
@@ -364,7 +428,7 @@ class NvramServer:
     """
 
     def __init__(self, binary_path, fs_path,
-                 reverse_host="10.201.169.58", reverse_port=9998, api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="qwen3-max"):
+                 reverse_host="10.201.169.58", reverse_port=9998, api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="deepseek-v3.2"):
         self.reverse_dir = f"/tmp/{os.path.basename(binary_path)}_decompile"
         self.binary_path = binary_path
         self.fs_path = fs_path
@@ -379,6 +443,7 @@ class NvramServer:
         self._parsed_functions = set()
         self.key_to_func_name = {}
         self.apmib_set_var_type = {}
+        self._initialized = False
         # 如果本地已存在已解析函数列表文件，则加载
         parsed_funcs_file = os.path.join(
             self.reverse_dir, "parsed_functions.json")
@@ -503,9 +568,11 @@ class NvramServer:
             api_key=api_key,
             base_url="https://api.vectorengine.ai/v1",
         )
-        self.try_max_num = 3  # Maximum retry attempts
+        self.try_max_num = 2  # Maximum retry attempts
         self.is_error = False
         self.stop_flag = False
+        # Host LLM server URL
+        self.host_llm_url = "http://172.18.0.1:8001/llm"
 
     def set_found_funcs(self, found_funcs):
         """
@@ -520,6 +587,18 @@ class NvramServer:
         time = self.consume_time
         self.consume_time = 0.0
         return time
+
+    def get_total_input_tokens(self):
+        """
+        获取总输入token数
+        """
+        return self.total_input_token
+
+    def get_total_output_tokens(self):
+        """
+        获取总输出token数
+        """
+        return self.total_output_token
 
     def remove_markdown_comments(self, code):
         """
@@ -730,37 +809,40 @@ Debug mode is disabled; skip checks that might block firmware continuation
 
         # 生成key_to_func_name.json文件
         # 使用在二进制文件中找到的nvram函数，生成key_to_func_name映射
-        if self.found_funcs:
-            print(f"[NvramServer] Using found nvram functions: {', '.join(self.found_funcs)}")
-            for func_name in self.found_funcs:                
-                if func_name not in self._parsed_functions:
-                    print(f"[NvramServer] Processing function: {func_name}")
-                    self.generate_key_to_func_json(func_name)
-                    self._parsed_functions.add(func_name)
-                    parsed_funcs_file = os.path.join(
-                        self.reverse_dir, "parsed_functions.json")
-                    try:
-                        with open(parsed_funcs_file, "w") as f:
-                            json.dump(list(self._parsed_functions), f, indent=2)
-                        print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
-                    except Exception as e:
-                        print(f"[NvramServer] Failed to save parsed function list: {e}")
-        else:
-            # 如果没有找到nvram函数，使用默认的nvram函数列表
-            print("[NvramServer] No found nvram functions, using default list")
-            for func_name in self.nvram_funcs_key_pos:                
-                if func_name not in self._parsed_functions:
-                    print(f"[NvramServer] Processing function: {func_name}")
-                    self.generate_key_to_func_json(func_name)
-                    self._parsed_functions.add(func_name)
-                    parsed_funcs_file = os.path.join(
-                        self.reverse_dir, "parsed_functions.json")
-                    try:
-                        with open(parsed_funcs_file, "w") as f:
-                            json.dump(list(self._parsed_functions), f, indent=2)
-                        print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
-                    except Exception as e:
-                        print(f"[NvramServer] Failed to save parsed function list: {e}")
+        if not self._initialized:
+            if self.found_funcs:
+                print(f"[NvramServer] Using found nvram functions: {', '.join(self.found_funcs)}")
+                for func_name in self.found_funcs:
+                    if func_name not in self._parsed_functions:
+                        print(f"[NvramServer] Processing function: {func_name}")
+                        self.generate_key_to_func_json(func_name)
+                        self._parsed_functions.add(func_name)
+                        parsed_funcs_file = os.path.join(
+                            self.reverse_dir, "parsed_functions.json")
+                        try:
+                            with open(parsed_funcs_file, "w") as f:
+                                json.dump(list(self._parsed_functions), f, indent=2)
+                            print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
+                        except Exception as e:
+                            print(f"[NvramServer] Failed to save parsed function list: {e}")
+            else:
+                # 如果没有找到nvram函数，使用默认的nvram函数列表
+                print("[NvramServer] No found nvram functions, using default list")
+                for func_name in self.nvram_funcs_key_pos:                
+                    if func_name not in self._parsed_functions:
+                        print(f"[NvramServer] Processing function: {func_name}")
+                        self.generate_key_to_func_json(func_name)
+                        self._parsed_functions.add(func_name)
+                        parsed_funcs_file = os.path.join(
+                            self.reverse_dir, "parsed_functions.json")
+                        try:
+                            with open(parsed_funcs_file, "w") as f:
+                                json.dump(list(self._parsed_functions), f, indent=2)
+                            print(f"[NvramServer] Updated parsed function list file: {parsed_funcs_file}")
+                        except Exception as e:
+                            print(f"[NvramServer] Failed to save parsed function list: {e}")
+            # 标记初始化完成
+            self._initialized = True
 
         # 检查key是否在key_to_func_name中
         if key not in self.key_to_func_name:
@@ -789,7 +871,7 @@ Debug mode is disabled; skip checks that might block firmware continuation
                     updated_system = prompt[1]["content"] + f"\nPrevious attempt failed with: Invalid output format\nLast response: {previous_response}\n"
                     prompt[1]["content"] = updated_system
 
-            start_time = time.time()
+            start_time = time.monotonic()
             
             # 增加LLM请求计数
             with self.llm_request_lock:
@@ -804,12 +886,12 @@ Debug mode is disabled; skip checks that might block firmware continuation
                 # 使用OpenAI客户端调用LLM
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    messages=prompt,
+                    messages=prompt, 
                     temperature=1,
                     top_p=0.5,
                 )
                 
-                end_time = time.time()
+                end_time = time.monotonic()
                 llm_time = end_time - start_time
 
                 # 打印输入token数
@@ -845,28 +927,34 @@ Debug mode is disabled; skip checks that might block firmware continuation
                 print(f"[NvramServer] Too many requests, waiting before retry...")
                 # 保存错误信息用于下次尝试
                 previous_response = f"Error: {str(e)}"
-                time.sleep(2)  # 速率限制，等待2秒后重试
+                time.sleep(3)  # 速率限制，等待2秒后重试
                 continue
             except APIConnectionError as e:
                 print(f"[NvramServer] Connection error: {e}")
-                print(f"[NvramServer] Network issue, retrying...")
+                print(f"[NvramServer] Network issue, trying host LLM server...")
+                # # 尝试使用host LLM服务
+                # host_response = self.call_host_llm(prompt)
+                # if host_response:
+                #     last_line = host_response.strip().split('\n')[-1]
+                #     if self.check_response(last_line):
+                #         return last_line
                 # 保存错误信息用于下次尝试
-                previous_response = f"Error: {str(e)}"
-                time.sleep(1)  # 连接错误，等待1秒后重试
+                # previous_response = f"Error: {str(e)}"
+                time.sleep(3)  # 连接错误，等待1秒后重试
                 continue
             except APIError as e:
                 print(f"[NvramServer] API error: {e}")
                 print(f"[NvramServer] Server error, retrying...")
                 # 保存错误信息用于下次尝试
                 previous_response = f"Error: {str(e)}"
-                time.sleep(1)  # API错误，等待1秒后重试
+                time.sleep(3)  # API错误，等待1秒后重试
                 continue
             except Exception as e:
                 print(f"[NvramServer] Unexpected error: {e}")
                 print(f"[NvramServer] Unknown error, retrying...")
                 # 保存错误信息用于下次尝试
                 previous_response = f"Error: {str(e)}"
-                time.sleep(1)  # 未知错误，等待1秒后重试
+                time.sleep(3)  # 未知错误，等待1秒后重试
                 continue
             finally:
                 # 减少LLM请求计数
@@ -1204,57 +1292,57 @@ Debug mode is disabled; skip checks that might block firmware continuation
         print(f"[NvramServer] Generated key_to_func_name.json file, path: {json_file_path}")
         return json_file_path
 
-    def parse_communication_file(self):
-        """
-        解析通信文件，获取FUNTION_NAME和KEY
+    # def parse_communication_file(self):
+    #     """
+    #     解析通信文件，获取FUNTION_NAME和KEY
 
-        Returns:
-            tuple: (function_name, key) 或 (None, None) 如果解析失败
-        """
-        try:
-            # 从容器中读取通信文件内容
-            exit_code, output = self.container.exec_run(
-                f"cat {self.communication_file}")
-            if exit_code != 0:
-                print(
-                    f"[NvramServer] 读取容器内通信文件失败: {output.decode('utf-8', errors='ignore')}")
-                return None, None
-            content = output.decode('utf-8', errors='ignore').strip()
+    #     Returns:
+    #         tuple: (function_name, key) 或 (None, None) 如果解析失败
+    #     """
+    #     try:
+    #         # 从容器中读取通信文件内容
+    #         exit_code, output = self.container.exec_run(
+    #             f"cat {self.communication_file}")
+    #         if exit_code != 0:
+    #             print(
+    #                 f"[NvramServer] 读取容器内通信文件失败: {output.decode('utf-8', errors='ignore')}")
+    #             return None, None
+    #         content = output.decode('utf-8', errors='ignore').strip()
 
-            # 解析格式: --nvram_function_name <FUNTION_NAME> --key <KEY>
-            pattern = r"--nvram_function_name\s+(\w+)\s+--key\s+(\w+)"
-            match = re.match(pattern, content)
+    #         # 解析格式: --nvram_function_name <FUNTION_NAME> --key <KEY>
+    #         pattern = r"--nvram_function_name\s+(\w+)\s+--key\s+(\w+)"
+    #         match = re.match(pattern, content)
 
-            if match:
-                function_name = match.group(1)
-                key = match.group(2)
-                return function_name, key
-            else:
-                print(f"[NvramServer] Invalid communication file format: {content}")
-                return None, None
-        except Exception as e:
-            print(f"[NvramServer] Error parsing communication file: {e}")
-            return None, None
+    #         if match:
+    #             function_name = match.group(1)
+    #             key = match.group(2)
+    #             return function_name, key
+    #         else:
+    #             print(f"[NvramServer] Invalid communication file format: {content}")
+    #             return None, None
+    #     except Exception as e:
+    #         print(f"[NvramServer] Error parsing communication file: {e}")
+    #         return None, None
 
-    def cleanup_files(self):
-        """
-        清理通信文件和锁文件（在容器内操作）
-        """
-        try:
-            # 删除容器内的通信文件
-            exit_code, output = self.container.exec_run(
-                f"rm -f {self.communication_file}")
-            if exit_code != 0:
-                print(
-                        f"[NvramServer] 删除容器内通信文件失败: {output.decode('utf-8', errors='ignore')}")
+    # def cleanup_files(self):
+    #     """
+    #     清理通信文件和锁文件（在容器内操作）
+    #     """
+    #     try:
+    #         # 删除容器内的通信文件
+    #         exit_code, output = self.container.exec_run(
+    #             f"rm -f {self.communication_file}")
+    #         if exit_code != 0:
+    #             print(
+    #                     f"[NvramServer] 删除容器内通信文件失败: {output.decode('utf-8', errors='ignore')}")
 
-            # 删除容器内的锁文件
-            exit_code, output = self.container.exec_run(
-                f"rm -f {self.lock_file}")
-            if exit_code != 0:
-                print(f"[NvramServer] 删除容器内锁文件失败: {output.decode('utf-8', errors='ignore')}") 
-        except Exception as e:
-            print(f"[NvramServer] Error cleaning container files: {e}")
+    #         # 删除容器内的锁文件
+    #         exit_code, output = self.container.exec_run(
+    #             f"rm -f {self.lock_file}")
+    #         if exit_code != 0:
+    #             print(f"[NvramServer] 删除容器内锁文件失败: {output.decode('utf-8', errors='ignore')}") 
+    #     except Exception as e:
+    #         print(f"[NvramServer] Error cleaning container files: {e}")
 
 
     def get_total_input_tokens(self):
@@ -1268,6 +1356,48 @@ Debug mode is disabled; skip checks that might block firmware continuation
         获取总输出token数
         """
         return self.total_output_token
+    
+    def call_host_llm(self, prompt):
+        """
+        调用host上的LLM服务
+        
+        Args:
+            prompt (list): LLM提示词
+        
+        Returns:
+            str: LLM响应
+        """
+        import requests
+        import json
+        
+        try:
+            print(f"[NvramServer] Calling host LLM server at {self.host_llm_url}")
+            response = requests.post(
+                self.host_llm_url,
+                json={
+                    "model": self.model,
+                    "messages": prompt,
+                    "temperature": 1,
+                    "top_p": 0.5
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            # 记录token使用情况
+            usage = response_data.get('usage', {})
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            completion_tokens = usage.get('completion_tokens', 0)
+            self.total_input_token += prompt_tokens
+            self.total_output_token += completion_tokens
+            print(f"[NvramServer] Host LLM server response received")
+            print(f"[NvramServer] Input tokens: {prompt_tokens}")
+            print(f"[NvramServer] Output tokens: {completion_tokens}")
+            return content
+        except Exception as e:
+            print(f"[NvramServer] Error calling host LLM server: {e}")
+            return None
 
 class StartupCommandServer:
     """
@@ -1276,7 +1406,7 @@ class StartupCommandServer:
     负责推理固件应用的启动命令
     """
     
-    def __init__(self, fs_path, bin_path, qemu_arch, container_name, api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="qwen3-max"):
+    def __init__(self, fs_path, bin_path, qemu_arch, container_name=None, api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="deepseek-v3.2"):
         self.fs_path = fs_path
         self.bin_path = bin_path
         self.qemu_arch = qemu_arch
@@ -1290,6 +1420,8 @@ class StartupCommandServer:
             api_key=api_key,
             base_url="https://api.vectorengine.ai/v1",
         )
+        # Host LLM server URL
+        self.host_llm_url = "http://172.18.0.1:8001/llm"
     
     def get_total_input_tokens(self):
         return self.total_input_token
@@ -1297,10 +1429,57 @@ class StartupCommandServer:
     def get_total_output_tokens(self):
         return self.total_output_token
     
+    def call_host_llm(self, prompt):
+        """
+        调用host上的LLM服务
+        
+        Args:
+            prompt (list): LLM提示词
+        
+        Returns:
+            str: LLM响应
+        """
+        import requests
+        import json
+        
+        try:
+            print(f"[StartupCommandServer] Calling host LLM server at {self.host_llm_url}")
+            response = requests.post(
+                self.host_llm_url,
+                json={
+                    "model": self.model,
+                    "messages": prompt,
+                    "temperature": 1,
+                    "top_p": 0.5
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            # 记录token使用情况
+            usage = response_data.get('usage', {})
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            completion_tokens = usage.get('completion_tokens', 0)
+            self.total_input_token += prompt_tokens
+            self.total_output_token += completion_tokens
+            print(f"[StartupCommandServer] Host LLM server response received")
+            print(f"[StartupCommandServer] Input tokens: {prompt_tokens}")
+            print(f"[StartupCommandServer] Output tokens: {completion_tokens}")
+            return content
+        except Exception as e:
+            print(f"[StartupCommandServer] Error calling host LLM server: {e}")
+            return None
+    
     def copy_logs_from_container(self):
         """
         将容器中的日志文件复制到宿主机的self.fs_path目录
+        仅复制每个app日志的前20个，以_trace.log为分隔
         """
+        if not self.container_name:
+            print("[StartupCommandServer] No container name provided, skipping log copy from container")
+            return
+            
         try:
             client = docker.from_env()
             container = client.containers.get(self.container_name)
@@ -1315,25 +1494,57 @@ class StartupCommandServer:
                     container_logs = output.split()
                     print(f"[StartupCommandServer] Found {len(container_logs)} trace.log files in container")
                     
+                    # 按app名分组日志文件
+                    app_logs = {}
                     for log_path in container_logs:
-                        # 获取文件名
                         log_name = os.path.basename(log_path)
-                        # 容器内的完整路径
-                        container_full_path = f"/fs/{log_name}"
-                        # 宿主机上的目标路径
-                        host_path = os.path.join(self.fs_path, log_name)
+                        # 以_trace.log为分隔符确定app名
+                        if "_trace.log" in log_name:
+                            app_name = log_name.split("_trace.log")[0]
+                        else:
+                            # 无法确定app名的文件，跳过
+                            continue
                         
-                        print(f"[StartupCommandServer] Copying {container_full_path} to {host_path}")
+                        if app_name not in app_logs:
+                            app_logs[app_name] = []
+                        app_logs[app_name].append(log_path)
+                    
+                    # 对每个app只复制前5个日志文件
+                    for app_name, logs in app_logs.items():
+                        # 按数字序排序日志文件，确保顺序一致
+                        def sort_key(log_path):
+                            log_name = os.path.basename(log_path)
+                            # 提取文件名中的数字部分
+                            import re
+                            numbers = re.findall(r'\d+', log_name)
+                            if numbers:
+                                return int(numbers[-1])  # 使用最后一个数字作为排序键
+                            return 0
                         
-                        # 使用get_archive获取文件内容
-                        archive_stream, _ = container.get_archive(container_full_path)
+                        logs.sort(key=sort_key)
+                        # 只取前5个
+                        selected_logs = logs[:5]
+                        print(f"[StartupCommandServer] Copying {len(selected_logs)} logs for app {app_name}")
                         
-                        # 提取文件到宿主机
-                        with open(host_path, 'wb') as f:
-                            for chunk in archive_stream:
-                                f.write(chunk)
-                        
-                        print(f"[StartupCommandServer] Successfully copied {log_name}")
+                        for log_path in selected_logs:
+                            # 获取文件名
+                            log_name = os.path.basename(log_path)
+                            # 容器内的完整路径
+                            container_full_path = f"/fs/{log_name}"
+                            # 宿主机上的目标路径
+                            host_path = os.path.join(self.fs_path, log_name)
+                            
+                            print(f"[StartupCommandServer] Copying {container_full_path} to {host_path}")
+                            
+                            # 使用get_archive获取文件内容
+                            archive_stream, _ = container.get_archive(container_full_path)
+                            
+                            # 提取文件到宿主机
+                            with open(host_path, 'wb') as f:
+                                for chunk in archive_stream:
+                                    f.write(chunk)
+                            
+                            print(f"[StartupCommandServer] Successfully copied {log_name}")
         except Exception as e:
             print(f"[StartupCommandServer] Error copying logs from container: {e}")
     
@@ -1348,6 +1559,9 @@ class StartupCommandServer:
         # 然后从self.fs_path获取日志
         existing_logs = sorted(glob.glob(os.path.join(self.fs_path, "*_trace.log*")))
         print(f"[StartupCommandServer] Found {len(existing_logs)} existing log files, prioritizing applications corresponding to these logs for filtering")
+        
+        # 存储文件及其包含目标应用的数量
+        file_target_count = []
         
         candidates = set()
         # 提取日志文件对应的应用名
@@ -1381,11 +1595,13 @@ class StartupCommandServer:
             out = subprocess.run(strings_cmd, shell=True, capture_output=True, text=True)
             # print(f"strings {app_path} | grep -w -i {target_app_name} output: {out.stdout}")
             if out.stdout:
-                print(f"[StartupCommandServer]      ✓ Found string containing {target_app_name} in {app_path}")
-                potential_start_target_files.append(app_path)
+                # 计算包含目标应用的数量
+                count = len(out.stdout.strip().split('\n'))
+                print(f"[StartupCommandServer]      ✓ Found string containing {target_app_name} in {app_path} (count: {count})")
+                file_target_count.append((app_path, count))
             
         # 如果没有匹配到任何log对应的应用，进行全盘搜索
-        if not potential_start_target_files:
+        if not file_target_count:
             print(f"[StartupCommandServer]   - No log file corresponding to {target_app_name}, starting full search for ELF files containing {target_app_name}...")
             # 跳过 gh_nvram、ghdev、ghproc、lib、proc、sys、greenhouse、www、dev、libexec 目录
             skip_dirs = {'gh_nvram', 'ghdev', 'ghproc', 'lib', 'proc', 'sys', 'greenhouse', 'www', 'dev', 'libexec', 'ghetc'}
@@ -1397,6 +1613,9 @@ class StartupCommandServer:
                     continue
                 for filename in filenames:
                     file_path = os.path.join(root, filename)
+                    # 如果是软连接则跳过
+                    if os.path.islink(file_path):
+                        continue
                     is_string = False
                     if filename.endswith('.sh'):
                         is_string = True
@@ -1420,21 +1639,43 @@ class StartupCommandServer:
                         strings_cmd = 'strings %s | grep -w -i %s' % (file_path, target_app_name)
                         out = subprocess.run(strings_cmd, shell=True, capture_output=True, text=True)
                         if out.stdout:
+                            # 计算包含目标应用的数量
+                            count = len(out.stdout.strip().split('\n'))
                             # print(f"   - Strings output: {out.stdout.strip()}")
-                            print(f"[StartupCommandServer]   ✓ Found string containing {target_app_name} in {file_path}")
-                            potential_start_target_files.append(file_path)
-                                
+                            print(f"[StartupCommandServer]   ✓ Found string containing {target_app_name} in {file_path} (count: {count})")
+                            file_target_count.append((file_path, count))
+        
+        # 根据含有目标应用的数量排序
+        file_target_count.sort(key=lambda x: x[1], reverse=True)
+        
+        # 提取排序后的文件路径
+        potential_start_target_files = [file_path for file_path, _ in file_target_count]
+        
+        # 只保留前两个文件
+        if len(potential_start_target_files) > 2:
+            print(f"[StartupCommandServer]   - Only keeping top 2 files based on target app count")
+            potential_start_target_files = potential_start_target_files[:2]
+        
         return potential_start_target_files
     
     def reverse_potential_start_target_files(self, potential_start_target_files):
         # Create ReverseClient instance
         reverse_client = ReverseClient()
         
+        # 用于存储需要从名单中删除的应用
+        apps_to_remove = []
+        
         for f in potential_start_target_files:
             if f.endswith('.sh'):
                 continue
             # For ELF files, use ReverseClient for decompilation
             else:                
+                # 检查文件大小是否超过1M
+                file_size = os.path.getsize(f)
+                if file_size > 1 * 1024 * 1024:  # 1MB
+                    print(f"[StartupCommandServer] File {f} is too large ({file_size/1024/1024:.2f}MB), skipping reverse analysis")
+                    continue
+                
                 f_basename = os.path.basename(f)
                 # Create decompile directory
                 decompile_dir = f"/tmp/{f_basename}_decompile"
@@ -1448,46 +1689,188 @@ class StartupCommandServer:
                 # 检查是否有本地IDA Pro
                 ida_path = '/ida/idat64'
                 if os.path.exists(ida_path):
-                    reverse_client.local_reverse_analysis(f, decompile_dir)
+                    # 启动逆向分析并监控时间
+                    import signal
+                    
+                    # 逆向分析线程
+                    def reverse_thread():
+                        try:
+                            reverse_client.local_reverse_analysis(f, decompile_dir)
+                        except Exception as e:
+                            print(f"[StartupCommandServer] Reverse analysis error: {e}")
+                    
+                    # 启动逆向线程
+                    reverse_thread = threading.Thread(target=reverse_thread)
+                    reverse_thread.daemon = True
+                    start_time = time.time()
+                    reverse_thread.start()
+                    
+                    # 等待逆向完成，最多20分钟
+                    reverse_thread.join(timeout=1200)  # 1200秒 = 20分钟
+                    
+                    if reverse_thread.is_alive():
+                        print(f"[StartupCommandServer] Reverse analysis for {f} exceeded 20 minutes, stopping and removing from list")
+                        # 查找并终止包含decompile_group的进程及其子进程
+                        try:
+                            import psutil
+                            print(f"[StartupCommandServer] Finding and killing decompile_group processes and their children")
+                            
+                            # 查找所有包含decompile_group的进程
+                            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                                try:
+                                    cmdline = ' '.join(p.info['cmdline']) if p.info['cmdline'] else ''
+                                    if 'decompile_group' in cmdline:
+                                        pid = p.info['pid']
+                                        print(f"[StartupCommandServer] Found decompile_group process {pid}")
+                                        
+                                        # 获取所有子进程
+                                        children = p.children(recursive=True)
+                                        print(f"[StartupCommandServer] Found {len(children)} child processes")
+                                        
+                                        # 先终止子进程
+                                        for child in children:
+                                            try:
+                                                print(f"[StartupCommandServer] Killing child process {child.pid}")
+                                                child.terminate()
+                                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                                print(f"[StartupCommandServer] Child process {child.pid} not found or access denied")
+                                        
+                                        # 等待子进程终止
+                                        time.sleep(2)
+                                        
+                                        # 终止主进程
+                                        print(f"[StartupCommandServer] Killing decompile_group process {pid}")
+                                        p.terminate()
+                                        
+                                        # 等待进程终止
+                                        try:
+                                            p.wait(timeout=5)
+                                        except psutil.TimeoutExpired:
+                                            # 如果进程在5秒内没有终止，使用SIGKILL强制终止
+                                            print(f"[StartupCommandServer] Force killing decompile_group process {pid}")
+                                            p.kill()
+                                            p.wait(timeout=2)
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                        except Exception as e:
+                            print(f"[StartupCommandServer] Error killing decompile_group processes: {e}")
+                        # 将应用添加到移除列表
+                        apps_to_remove.append(f)
                 else:
                     reverse_client.send_binary_for_analysis(f, decompile_dir)
+        
+        # 从potential_start_target_files中移除超时的应用
+        for app in apps_to_remove:
+            if app in potential_start_target_files:
+                potential_start_target_files.remove(app)
+                print(f"[StartupCommandServer] Removed {app} from potential start target files list")
                     
     def get_target_app_help_info(self, target_app_name):
         help_info = ""
+        
         # 使用Docker容器运行qemu命令获取帮助信息
         import docker
+        from docker.errors import BuildError
+        import os
+        import shutil
+        import stat
         
         # 定义常量
         DOCKER_FS = "fs"
+        TMP_DIR = "/tmp/greencontainers"
+        SETUP_SCRIPT = "run_setup.sh"
         
         # 创建Docker客户端
         client = docker.from_env()
         
         try:
-            # 获取已存在的容器
-            tempCont = client.containers.get(self.container_name)
-            
-            # 计算容器内的路径
-            relative_bin_path = self.bin_path.replace(self.fs_path, "")
-            qemu_command = ["chroot", DOCKER_FS, "/"+self.qemu_arch, relative_bin_path, "--help"]
-            help_cmd = " ".join(qemu_command)
-            # print(f"target app help cmd: {help_cmd}")
-            result = tempCont.exec_run(
-                help_cmd,
-                stream=False,
-                detach=False,
-                tty=True
-            )
+            if self.container_name:
+                # 获取已存在的容器
+                tempCont = client.containers.get(self.container_name)
                 
-            help_info = result.output.decode('utf-8', errors='ignore').strip()
-            # print(f"target app help output: {help_info}")
-            return help_info
+                # 计算容器内的路径
+                relative_bin_path = self.bin_path.replace(self.fs_path, "")
+                qemu_command = ["chroot", DOCKER_FS, "/"+self.qemu_arch, relative_bin_path, "--help"]
+                help_cmd = " ".join(qemu_command)
+                # print(f"target app help cmd: {help_cmd}")
+                result = tempCont.exec_run(
+                    help_cmd,
+                    stream=False,
+                    detach=False,
+                    tty=True
+                )
+                    
+                help_info = result.output.decode('utf-8', errors='ignore').strip()
+                print(f"target app help output: {help_info}")
+                return help_info
+            else:
+                # 没有容器名称，构造一个临时容器
+                print("[StartupCommandServer] No container name provided, creating temporary container to get help info")
+                
+                # 确保临时目录存在
+                if not os.path.exists(TMP_DIR):
+                    os.makedirs(TMP_DIR)
+                
+                # 复制文件系统到临时目录
+                dest = os.path.join(TMP_DIR, "fs")
+                Files.copy_directory(self.fs_path, dest)
+                
+                # 创建Dockerfile
+                dockerfilePath = os.path.join(TMP_DIR, "Dockerfile")
+                SCRATCH_COMMANDS = f"FROM ubuntu:20.04\nCOPY fs /{DOCKER_FS}\n"
+                with open(dockerfilePath, "w") as dockerFile:
+                    dockerFile.write(SCRATCH_COMMANDS)
+                    dockerFile.write("\nCMD [\"/bin/sh\"]\n")
+                
+                # 构建Docker镜像
+                print("[StartupCommandServer] Building temporary Docker image...")
+                build_success = False
+                while not build_success:
+                    try:
+                        img, jsonlog = client.images.build(path=TMP_DIR, rm=True)
+                        build_success = True
+                    except BuildError as e:
+                        print(f"[StartupCommandServer] Build error: {e}")
+                        print("[StartupCommandServer] Retrying in 10 seconds...")
+                        import time
+                        time.sleep(10)
+                        continue
+                
+                # 创建并启动临时容器
+                print("[StartupCommandServer] Creating temporary container...")
+                tempCont = client.containers.create(img, detach=False, tty=True, mem_limit="64G",
+                                                      ipc_mode="shareable", privileged=True)
+                tempCont.start(timeout=300)
+                
+                # 计算容器内的路径
+                relative_bin_path = self.bin_path.replace(self.fs_path, "")
+                qemu_command = ["chroot", DOCKER_FS, "/"+self.qemu_arch, relative_bin_path, "--help"]
+                help_cmd = " ".join(qemu_command)
+                # print(f"target app help cmd: {help_cmd}")
+                
+                # 执行命令获取帮助信息
+                result = tempCont.exec_run(
+                    help_cmd,
+                    stream=False,
+                    detach=False,
+                    tty=True
+                )
+                    
+                help_info = result.output.decode('utf-8', errors='ignore').strip()
+                # print(f"target app help output: {help_info}")
+                
+                # 停止和清理容器
+                tempCont.stop(300)
+                tempCont.remove(force=True)
+                client.images.remove(img.id, force=True)
+                
+                return help_info
         except docker.errors.NotFound:
             print(f"[StartupCommandServer] Container '{self.container_name}' does not exist, please check the container name is correct")
         except docker.errors.APIError as e:
             print(f"[StartupCommandServer] Docker API call failed: {e}")
         except Exception as e:
-            print(f"[StartupCommandServer] Unknown error occurred when getting container instance: {e}")
+            print(f"[StartupCommandServer] Unknown error occurred when getting help info: {e}")
                 
         return help_info
                     
@@ -1516,36 +1899,38 @@ class StartupCommandServer:
             lines = content.splitlines(keepends=True)
             total_lines = len(lines)
             
-            # 1. 首先找到target_app_name所在的行号line_num
+            # 1. 找到函数定义的行号，在逆向代码中是函数名第二次出现的行号
+            file_name = os.path.basename(file_path)
+            base_func_name = file_name.replace('.c', '')
+            func_line = -1
+            appear_cnt = 0
+            for idx in range(len(lines)):
+                if base_func_name in lines[idx]:
+                    appear_cnt += 1
+                    if appear_cnt == 2:
+                        func_line = idx
+                        break
+            
+            # 2. 从func_line后查找target_app_name所在的行号line_num
             line_num = -1
-            for idx, line in enumerate(lines):
-                if target_app_name in line:
+            start_search_idx = func_line if func_line > 0 else 0
+            for idx in range(start_search_idx, len(lines)):
+                if target_app_name in lines[idx]:
                     line_num = idx + 1
                     break
             
             if line_num == -1:
                 return combined_content, lines_used
             
-            # 2. 初始化变量
+            # 3. 初始化变量
             header_lines = []
             key_snippet_lines = []
             
-            # 3. 处理代码截取
+            # 4. 处理代码截取
             # 函数行数小于100行，直接截取全部代码
             if total_lines < 100:
                 key_snippet_lines = lines
             else:
-                # 找到函数定义的行号，在逆向代码中是函数名第二次出现的行号
-                file_name = os.path.basename(file_path)
-                base_func_name = file_name.replace('.c', '')
-                func_line = -1
-                appear_cnt = 0
-                for idx in range(len(lines)):
-                    if base_func_name in lines[idx]:
-                        appear_cnt += 1
-                        if appear_cnt == 2:
-                            func_line = idx
-                            break
                 # 如果找到函数定义行，则把该行及之前的变量数据信息也加入提示
                 if func_line > 0:
                     header_lines = lines[:func_line]
@@ -1555,7 +1940,7 @@ class StartupCommandServer:
                 end_line = min(total_lines, line_num + 49)
                 key_snippet_lines = lines[start_line - 1:end_line]
             
-            # 4. 合并header与关键代码段，精确防止重叠
+            # 5. 合并header与关键代码段，精确防止重叠
             combined_lines = []
             if header_lines and key_snippet_lines:
                 # 获取key_snippet_lines的起始行索引
@@ -1580,7 +1965,7 @@ class StartupCommandServer:
         
         return combined_content, lines_used
     
-    def get_infer_startup_prompt(self, target_app_name, potential_start_target_files, ps_target_app_startup):
+    def get_infer_startup_prompt(self, target_app_name, potential_start_target_files, ps_target_app_startup, firmae_info=None):
         # 获取目标应用的--help信息
         help_info = self.get_target_app_help_info(target_app_name)
         
@@ -1594,6 +1979,7 @@ Guidelines:
 3. If multiple branches exist in the code, choose the branch that represents the default.
 4. Substitute placeholders (e.g., %d, %s) with concrete values inferred from the code.
 5. Give the absolute path of the file.
+6. Do not include placeholders (%s, %c, etc).
 
 Output format:
 <target_app_name> <parameters>
@@ -1676,6 +2062,13 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
         if ps_target_app_startup:
             ps_info = "\n".join(ps.decode() for ps in ps_target_app_startup)
             user_content += f"\ntarget app process information from ps:\n{ps_info}\n"
+        
+        # 将FirmAE信息追加到user_content
+        if firmae_info:
+            firmae_info_str = "\nInformation obtained from the ps during the operation of other rehosting frameworks:\n"
+            if 'new_run_args' in firmae_info and firmae_info['new_run_args']:
+                firmae_info_str += f"- Run arguments from FirmAE: {firmae_info['new_run_args']}\n"
+            user_content += firmae_info_str
 
         # 构造LLM请求
         prompt = [
@@ -1717,6 +2110,80 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
         missing_files = []
         file_mapping = {}
         updated_command = command
+        
+        if not self.container_name:
+            print("[StartupCommandServer] No container name provided, checking files in fs_path")
+            # 在fs_path路径下查找文件
+            if hasattr(self, 'fs_path') and self.fs_path:
+                for file_path in potential_files:
+                    actual_path = None
+                    
+                    # 先判断路径是否带有 /
+                    if '/' in file_path:
+                        # 带/表明是路径文件，先检查是否存在该文件
+                        # 在fs_path路径下检查
+                        # 确保路径拼接正确，处理相对路径和绝对路径
+                        if file_path.startswith('/'):
+                            full_path = os.path.join(self.fs_path, file_path.lstrip('/'))
+                        else:
+                            full_path = os.path.join(self.fs_path, file_path)
+                        
+                        if os.path.exists(full_path) and os.path.isfile(full_path):
+                            actual_path = full_path
+                        else:
+                            # 如果查找不到，使用find去查找basename
+                            filename = file_path.split('/')[-1]
+                            # 在fs_path下查找文件
+                            for root, dirs, files in os.walk(self.fs_path):
+                                if filename in files:
+                                    actual_path = os.path.join(root, filename)
+                                    break
+                    else:
+                        # 不带/，直接使用find查找文件
+                        # 在fs_path下查找文件
+                        for root, dirs, files in os.walk(self.fs_path):
+                            if file_path in files:
+                                actual_path = os.path.join(root, file_path)
+                                break
+                    
+                    # 标记是否为文件夹
+                    is_directory = False
+                    
+                    # 如果都没找到文件，判断是不是文件夹
+                    if not actual_path:
+                        # 检查是否为文件夹
+                        if '/' in file_path:
+                            # 带/的路径，检查是否为文件夹
+                            # 确保路径拼接正确，处理相对路径和绝对路径
+                            if file_path.startswith('/'):
+                                full_path = os.path.join(self.fs_path, file_path.lstrip('/'))
+                            else:
+                                full_path = os.path.join(self.fs_path, file_path)
+                            if os.path.exists(full_path) and os.path.isdir(full_path):
+                                is_directory = True
+                        else:
+                            # 不带/的路径，尝试在fs_path下查找同名文件夹
+                            for root, dirs, files in os.walk(self.fs_path):
+                                if file_path in dirs:
+                                    is_directory = True
+                                    break
+                    
+                    if actual_path:
+                        # 记录文件映射关系
+                        file_mapping[file_path] = actual_path
+                        # 替换命令中的文件路径
+                        # 在chroot fs环境下执行，需要移除fs_path前缀
+                        chroot_path = actual_path.replace(self.fs_path, '', 1)
+                        updated_command = updated_command.replace(file_path, chroot_path)
+                    elif is_directory:
+                        # 如果是文件夹，不管是否存在，都不添加到缺失文件列表
+                        pass
+                    else:
+                        # 如果不是文件夹且仍然没有找到文件，则添加到缺失文件列表
+                        missing_files.append(file_path)
+            else:
+                print("[StartupCommandServer] No fs_path provided, skipping file existence check")
+            return missing_files, file_mapping, updated_command
         
         # 创建Docker客户端
         client = docker.from_env()
@@ -1817,7 +2284,10 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
                     # 在chroot fs环境下执行，需要移除/fs前缀
                     chroot_path = actual_path.replace('/fs', '', 1)
                     updated_command = updated_command.replace(file_path, chroot_path)
-                elif not is_directory:
+                elif is_directory:
+                    # 如果是文件夹，不管是否存在，都不添加到缺失文件列表
+                    pass
+                else:
                     # 如果不是文件夹且仍然没有找到文件，则添加到缺失文件列表
                     missing_files.append(file_path)
                     
@@ -1830,13 +2300,21 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
         
         return missing_files, file_mapping, updated_command
     
-    def llm_infer_start_target_app(self, potential_start_target_files, ps_target_app_startup):
+    def llm_infer_start_target_app(self, potential_start_target_files, ps_target_app_startup, firmae_info=None):
         target_app_name = os.path.basename(self.bin_path)
         
         # 获取prompt
-        prompt = self.get_infer_startup_prompt(target_app_name, potential_start_target_files, ps_target_app_startup)
+        prompt = self.get_infer_startup_prompt(target_app_name, potential_start_target_files, ps_target_app_startup, firmae_info=firmae_info)
+        # print("[StartupCommandServer] LLM prompt:")
+        # print("=" * 80)
+        # for message in prompt:
+        #     lines = message['content'].strip().split('\n')
+        #     for line in lines:
+        #         print(f"  {line}")
+        #     print()
+        # print("=" * 80)
         
-        max_retries = 5
+        max_retries = 2
         retry_count = 0
         inferred_cmd = ""
         # 存储最后一次尝试的信息
@@ -1845,7 +2323,7 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
         
         while retry_count < max_retries:
             try:
-                start_time = time.time()
+                start_time = time.monotonic()
                 
                 # 使用OpenAI客户端调用LLM
                 response = self.client.chat.completions.create(
@@ -1855,7 +2333,7 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
                     top_p=0.5,
                 )
                 
-                end_time = time.time()
+                end_time = time.monotonic()
                 llm_time = end_time - start_time
                 
                 # 记录token使用情况
@@ -1886,7 +2364,7 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
                         print(f"[StartupCommandServer] Command uses missing files: {missing_files}")
                         print(f"[StartupCommandServer] Retrying to get a valid command...")
                         missing_files_str = ", ".join(missing_files)
-                        prompt[1]["content"] += f"\nLast attempt:{inferred_cmd}. There are no files with the same name in file system: {missing_files_str}. Please don't use these files.\n"
+                        prompt[1]["content"] += f"\nLast attempt:{inferred_cmd}. There are no files with the same basename in file system: {missing_files_str}. Please don't use these files.\n"
                         # 保存最后一次尝试的信息
                         last_missing_files = missing_files
                         last_inferred_cmd = inferred_cmd
@@ -1910,22 +2388,37 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
                 print(f"[StartupCommandServer] Rate limit error: {e}")
                 print(f"[StartupCommandServer] Too many requests, waiting before retry...")
                 retry_count += 1
-                time.sleep(2)  # 速率限制，等待2秒后重试
+                time.sleep(3)  # 速率限制，等待2秒后重试
             except APIConnectionError as e:
                 print(f"[StartupCommandServer] Connection error: {e}")
-                print(f"[StartupCommandServer] Network issue, retrying...")
-                retry_count += 1
-                time.sleep(1)  # 连接错误，等待1秒后重试
+                print(f"[StartupCommandServer] Network issue, trying host LLM server...")
+                # 尝试使用host LLM服务
+                # host_response = self.call_host_llm(prompt)
+                # if host_response:
+                #     inferred_cmd = host_response.strip().split('\n')[-1]
+                #     first_word = inferred_cmd.split()[0] if inferred_cmd.split() else ""
+                #     first_word_basename = os.path.basename(first_word)
+                #     if first_word_basename == target_app_name:
+                #         # 检查命令中使用的文件是否存在，并替换为实际路径
+                #         missing_files, file_mapping, updated_cmd = self.check_command_files_exist(inferred_cmd)
+                #         inferred_cmd = updated_cmd
+                #         if not missing_files:
+                #             print(f"[StartupCommandServer] Original inferred command: {inferred_cmd}")
+                #             print(f"[StartupCommandServer] File mapping: {file_mapping}")
+                #             return inferred_cmd
+                # # 如果host LLM服务也失败，继续重试
+                # retry_count += 1
+                time.sleep(3)  # 连接错误，等待1秒后重试
             except APIError as e:
                 print(f"[StartupCommandServer] API error: {e}")
                 print(f"[StartupCommandServer] Server error, retrying...")
                 retry_count += 1
-                time.sleep(1)  # API错误，等待1秒后重试
+                time.sleep(3)  # API错误，等待1秒后重试
             except Exception as e:
                 print(f"[StartupCommandServer] Unexpected error: {e}")
                 print(f"[StartupCommandServer] Unknown error, retrying...")
                 retry_count += 1
-                time.sleep(1)  # 未知错误，等待1秒后重试
+                time.sleep(3)  # 未知错误，等待1秒后重试
             
         # 所有重试都失败，尝试处理最后一次的结果
         if last_inferred_cmd and last_missing_files:
@@ -1963,19 +2456,20 @@ Inferred command: mini_httpd -M 0 -C /var/tmp/mini_httpd_0.conf
             
         return inferred_cmd
     
-    def get_target_app_startup(self, ps_target_app_startup):
+    def get_target_app_startup(self, ps_target_app_startup, firmae_info=None):
         """
         获取目标应用的启动命令
         
         Args:
             ps_target_app_startup: 进程快照中的目标应用启动信息
+            firmae_info: FirmAE提供的信息，包括new_run_args
             
         Returns:
             str: 推理出的目标应用启动命令
         """
         potential_start_target_files = self.get_potential_start_target_files()
         self.reverse_potential_start_target_files(potential_start_target_files)
-        return self.llm_infer_start_target_app(potential_start_target_files, ps_target_app_startup)
+        return self.llm_infer_start_target_app(potential_start_target_files, ps_target_app_startup, firmae_info=firmae_info)
 
 class ContainerPsMonitor:
     """
@@ -2004,7 +2498,9 @@ class ContainerPsMonitor:
         self.max_cmd_count = max_cmd_count
         self.banned_cmds_file = os.path.join(self.fs_path, "banned_cmds.txt")
         self.banned_cmds = self.load_banned_cmds()
-        self.whitelist_cmds = {"qemu_run.sh", "qemu_run_target.sh"}
+        self.whitelist_cmds = {"qemu_run.sh", "qemu_run_target.sh", "init", "sysinit", "procd", "preinitmt", "preinit", "rc_apps", "profile", "/sbin/preinit", "/bin/init","/sbin/init", "/etc/init", "/sbin/rc", 
+                  "/etc/init.d/rcS", "/usr/etc/rcS", "/etc/system/sysinit", "/sbin/rc", "/etc/init.d/rc"
+                  "/sbin/rcd", "/sbin/procd", "/sbin/rc_app/rc_apps"}
         self.banned_cmd_scripts = {}
         # shell脚本扩展名
         self.shell_extensions = {'.sh', '.bash', '.ksh', '.zsh', '.csh'}
@@ -2099,7 +2595,7 @@ class ContainerPsMonitor:
             ps_output: ps命令的输出结果
         
         Returns:
-            list: shell进程树的叶子节点列表，每个节点包含pid和cmd
+            tuple: (leaf_processes, processes, ppid_map) 叶子节点列表，进程字典，父进程到子进程的映射
         """
         processes = {}
         ppid_map = defaultdict(list)
@@ -2154,7 +2650,38 @@ class ContainerPsMonitor:
         if root_pid is not None:
             dfs(root_pid)
         
-        return leaf_processes
+        return leaf_processes, processes, ppid_map
+    
+    def has_target_process_child(self, pid, processes, ppid_map):
+        """
+        检查进程是否有子进程在运行目标进程
+        
+        Args:
+            pid: 进程ID
+            processes: 进程字典
+            ppid_map: 父进程到子进程的映射
+            
+        Returns:
+            bool: 是否有子进程在运行目标进程
+        """
+        if not self.bin_path:
+            return False
+        
+        app_name = os.path.basename(self.bin_path)
+        
+        def dfs_check(pid):
+            """深度优先搜索检查子进程是否运行目标进程"""
+            children = ppid_map.get(pid, [])
+            for child_pid in children:
+                if child_pid in processes:
+                    child_cmd = processes[child_pid]['cmd']
+                    if app_name in child_cmd:
+                        return True
+                    if dfs_check(child_pid):
+                        return True
+            return False
+        
+        return dfs_check(pid)
     
     def _get_ignore_pid_from_lock_file(self):
         """
@@ -2242,10 +2769,10 @@ class ContainerPsMonitor:
                     # 在容器内删除脚本文件
                     exit_code, output = self.container.exec_run(f"rm -f /{self.DOCKER_FS}/{script_path}")
                     # print(f"[ContainerPsMonitor] rm_cmd: {f'rm -f /{self.DOCKER_FS}/{script_path}'}, exit_code: {exit_code}, output: {output.decode('utf-8', errors='ignore')}")
-                    # if exit_code == 0:
-                    #     print(f"[ContainerPsMonitor] Successfully deleted script '{script_path}'")
-                    # else:
-                    #     print(f"[ContainerPsMonitor] Failed to delete script '{script_path}': {output.decode('utf-8', errors='ignore')}")
+                    if exit_code == 0:
+                        print(f"[ContainerPsMonitor] Successfully deleted script '{script_path}'")
+                    else:
+                        print(f"[ContainerPsMonitor] Failed to delete script '{script_path}': {output.decode('utf-8', errors='ignore')}")
                 else:
                     print(f"[ContainerPsMonitor] Script '{script_path}' not found, skipping deletion")
         except Exception as e:
@@ -2287,7 +2814,7 @@ class ContainerPsMonitor:
             exit_code, output = self.container.exec_run("ps -efww")
             if exit_code == 0:
                 ps_output = output.decode('utf-8')
-                leaf_processes = self.parse_ps_output(ps_output)
+                leaf_processes, processes, ppid_map = self.parse_ps_output(ps_output)
                 # print(f"[ContainerPsMonitor] leaf_processes count: {len(leaf_processes)}")
                 # print(f"[ContainerPsMonitor] leaf_processes: {leaf_processes}")
                 
@@ -2313,6 +2840,12 @@ class ContainerPsMonitor:
                             self.kill_process(ppid)
                         continue
                     
+                    # 检查子进程是否运行目标进程
+                    if self.has_target_process_child(pid, processes, ppid_map):
+                        print(f"[ContainerPsMonitor] Process {pid} has target process child, resetting count to 0")
+                        self.cmd_leaf_counts[cmd] = 0
+                        continue
+                    
                     # # 如果pid和ignore_pid相同则跳过（类型均为int，可直接比较）
                     # if ignore_pid is not None and int(pid) == ignore_pid:
                     #     continue
@@ -2335,17 +2868,31 @@ class ContainerPsMonitor:
                         if is_whitelisted:
                             continue
                         
-                        print(f"[ContainerPsMonitor] Command '{cmd}' exceeded {self.max_cmd_count} counts, banning and killing process {pid}")
-                        # 添加到被禁止列表
-                        self.banned_cmds.add(cmd)
-                        # 保存到本地文件
-                        self.save_banned_cmd(cmd)
-                        # kill进程
-                        self.kill_process(pid)
-                        # 增加命令被kill的次数
-                        self.cmd_kill_counts[cmd] += 1
-                        kill_count = self.cmd_kill_counts[cmd]
-                        # print(f"[ContainerPsMonitor] Command '{cmd}' has been killed {kill_count} times")
+                        # 检查子进程
+                        children = ppid_map.get(pid, [])
+                        if children:
+                            print(f"[ContainerPsMonitor] Command '{cmd}' exceeded {self.max_cmd_count} counts, banning and killing child processes first")
+                            # 先ban并kill子进程
+                            for child_pid in children:
+                                if child_pid in processes:
+                                    child_cmd = processes[child_pid]['cmd']
+                                    print(f"[ContainerPsMonitor] Killing child process {child_pid} ({child_cmd})")
+                                    self.kill_process(child_pid)
+                            # 减少计数20次
+                            self.cmd_leaf_counts[cmd] -= 40
+                            print(f"[ContainerPsMonitor] Command '{cmd}' count reduced by 20, new count: {self.cmd_leaf_counts[cmd]}")
+                        else:
+                            print(f"[ContainerPsMonitor] Command '{cmd}' exceeded {self.max_cmd_count} counts, banning and killing process {pid}")
+                            # 添加到被禁止列表
+                            self.banned_cmds.add(cmd)
+                            # 保存到本地文件
+                            self.save_banned_cmd(cmd)
+                            # kill进程
+                            self.kill_process(pid)
+                            # 增加命令被kill的次数
+                            self.cmd_kill_counts[cmd] += 1
+                            kill_count = self.cmd_kill_counts[cmd]
+                            # print(f"[ContainerPsMonitor] Command '{cmd}' has been killed {kill_count} times")
                         
                 # 对于所有的父shell进程，将其计数-1，避免其中的子shell进程由于父进程被杀掉而直接不启动
                 for cmd in self.cmd_leaf_counts.keys():
@@ -2454,8 +3001,8 @@ class InitServer:
         "exec", "eval", "source", "unlink",
         "bash", "sh", "dash", "zsh", "csh",
         "ls", "cat", "echo", "cp", "mv", "rm", "mkdir", "rmdir",
-        "cd", "pwd", "grep", "sed", "awk", "head", "tail", "test"
-        "ps", "top", "kill", "chmod", "chown", "chgrp", "expr"
+        "cd", "pwd", "grep", "sed", "awk", "head", "tail", "test",
+        "ps", "top", "kill", "chmod", "chown", "chgrp", "expr",
         "touch", "ln", "find", "xargs", "cut", "sort", "uniq",
         "wc", "diff", "patch", "tar", "gzip", "gunzip", "zip", "unzip",
         "date", "time", "sleep", "true", "false", "exit", "[", "[[",
@@ -2486,22 +3033,20 @@ class InitServer:
     
     # 黑名单包含危险命令，这些命令始终被禁止执行
     IMMUTABLE_BLACKLIST = {
-        "insmod", "modprobe", "rmmod", "shutdown"
-        "mount", "umount", "poweroff", "reboot"
+        "insmod", "modprobe", "rmmod", "shutdown", "mknod",
+        "mount", "umount", "poweroff", "reboot", "nvram", "flash"
     }
 
     def __init__(self, container_fs_path, container_name, fs_path,
                  api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5", model="deepseek-v3.2",
-                 target_application="HTTP Server", host_accesscontrold="192.168.0.5", port_accesscontrold=9999):
+                 target_application="HTTP Server"):
         self.container_fs_path = container_fs_path
         self.container_name = container_name
         self.fs_path = fs_path
         self.api_key = api_key
         self.model = model
         self.target_application = target_application
-        self.host = host_accesscontrold
-        self.port = port_accesscontrold
-        self.try_max_num = 3
+        self.try_max_num = 2
         
         # 设置环境变量
         # os.environ['https_proxy'] = f'http://{proxy_ip}:{proxy_port}'
@@ -2557,6 +3102,8 @@ class InitServer:
             api_key=api_key,
             base_url="https://api.vectorengine.ai/v1",
         )
+        # Host LLM server URL
+        self.host_llm_url = "http://172.18.0.1:8001/llm"
         
         # 构建提示词
         self.system_content = f'''
@@ -2571,6 +3118,7 @@ Editing Rules
 1. Commands that must always be retained: cp, echo, mkdir.
 2. Output the full modified script, with no comments (all # ... lines removed).
 3. Use a conservative strategy: If you are unsure whether a command affects {self.target_application}, keep it.
+4. Include a brief explanation in the output, the explanation needs to be commented(#).
 
 Classification Criteria
 Retain relevant operations:
@@ -2666,43 +3214,9 @@ brctl addbr br0
             cleaned_content = cleaned_content[:-1]
         return cleaned_content
 
-    def send_request_via_tcp(self, host: str, port: int, obj, timeout=10.0):
-        """
-        通过TCP socket发送请求
-        """
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            data = json.dumps(obj, ensure_ascii=False) + "\n"
-            s.sendall(data.encode("utf-8"))
-            resp = b""
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                resp += chunk
-                if b"\n" in resp:
-                    line, _ = resp.split(b"\n", 1)
-                    return json.loads(line.decode("utf-8"))
-        raise RuntimeError("no response")
-
-    def _call_accesscontrol_client(self, command: str, entry: str = None) -> dict:
-        """
-        调用accesscontrol客户端
-        """
-        obj = {"action": command}
-        if entry is not None:
-            obj["entry"] = entry
-        
-        try:
-            resp = self.send_request_via_tcp(self.host, self.port, obj, timeout=10.0)
-            # print(f"[InitServer] AccessControl command '{command}' succeeded")
-            return resp
-        except Exception as e:
-            print(f"[InitServer] [!] TCP IPC failed: {e}")
-            return {"status": "error", "message": f"TCP IPC failed: {e}"}
-
     def load_whitelist_blacklist(self, list_type="both", force_reload=False):
         """
-        加载白名单和黑名单
+        加载预设的白名单和黑名单
         """
         if list_type not in ["both", "whitelist", "blacklist"]:
             print(f"[InitServer] [!] Invalid list_type: {list_type}, using 'both'")
@@ -2726,30 +3240,16 @@ brctl addbr br0
             return True
         
         if need_whitelist:
-            print("[InitServer] Loading whitelist from accesscontrold")
-            whitelist_response = self._call_accesscontrol_client("whitelist_list")
-            if whitelist_response.get("status") == "ok":
-                self.whitelist = set(whitelist_response.get("data", []))
-                self.whitelist_loaded = True
-                print(f"[InitServer] Whitelist loaded: {len(self.whitelist)} entries")
-            else:
-                print(f"[InitServer] [!] Failed to load whitelist: {whitelist_response.get('message', 'Unknown error')}")
-                # self.whitelist = set()
-                # self.whitelist_loaded = False
-                return False
+            print("[InitServer] Loading whitelist from preset")
+            self.whitelist = self.IMMUTABLE_WHITELIST.copy()
+            self.whitelist_loaded = True
+            print(f"[InitServer] Whitelist loaded: {len(self.whitelist)} entries")
         
         if need_blacklist:
-            print("[InitServer] Loading blacklist from accesscontrold")
-            blacklist_response = self._call_accesscontrol_client("blacklist_list")
-            if blacklist_response.get("status") == "ok":
-                self.blacklist = set(blacklist_response.get("data", []))
-                self.blacklist_loaded = True
-                print(f"[InitServer] Blacklist loaded: {len(self.blacklist)} entries")
-            else:
-                print(f"[InitServer] [!] Failed to load blacklist: {blacklist_response.get('message', 'Unknown error')}")
-                # self.blacklist = set()
-                # self.blacklist_loaded = False
-                return False
+            print("[InitServer] Loading blacklist from preset")
+            self.blacklist = self.IMMUTABLE_BLACKLIST.copy()
+            self.blacklist_loaded = True
+            print(f"[InitServer] Blacklist loaded: {len(self.blacklist)} entries")
         
         return True
 
@@ -2811,15 +3311,15 @@ brctl addbr br0
                 for item in value:
                     self.extract_commands(item, cmds)
 
-    def parse_init_script(self, save_original=False):
+    def parse_init_script(self, script_path, save_original=False):
         """
         解析init脚本为AST，并提取命令
         
         Returns:
             bool: 解析成功返回True，失败返回False
         """
-        # 使用已经转换好的self.init_script_path
-        real_init_script_path = os.path.join(self.fs_path, self.init_script_path.lstrip("/"))
+        # 使用已经转换好的script_path
+        real_init_script_path = os.path.join(self.fs_path, script_path.lstrip("/"))
             
         base_name, _ = os.path.splitext(os.path.basename(real_init_script_path))
         parser_ast_path = f"/tmp/{base_name}_ast.json"
@@ -2865,16 +3365,18 @@ brctl addbr br0
             print(f"[InitServer] [✖] Failed to load or parse AST data from {parser_ast_path}")
             return False
         
+        # 临时存储命令
+        temp_cmds = []
+        self.extract_commands(ast_data, temp_cmds)
+        
         # 如果保存原始命令集(方便对比过滤前后命令差别)，则先保存到original_cmds，否则保存到cmds
         if save_original:
-            self.extract_commands(ast_data, self.original_cmds)
-            # print(f"Original commands: {', '.join(self.original_cmds)}")
+            self.original_cmds = temp_cmds.copy()
         else:
-            self.extract_commands(ast_data, self.cmds)
-            # print(f"Current commands: {', '.join(self.cmds)}")
+            self.cmds = temp_cmds.copy()
         
         return True
-
+    
     def get_time(self) -> float:
         """
         获取指定时间类型的时间值
@@ -2884,6 +3386,48 @@ brctl addbr br0
         time = time + self.check_blacklist_time
         self.check_blacklist_time = 0.0
         return time
+    
+    def call_host_llm(self, prompt):
+        """
+        调用host上的LLM服务
+        
+        Args:
+            prompt (list): LLM提示词
+        
+        Returns:
+            str: LLM响应
+        """
+        import requests
+        import json
+        
+        try:
+            print(f"[InitServer] Calling host LLM server at {self.host_llm_url}")
+            response = requests.post(
+                self.host_llm_url,
+                json={
+                    "model": self.model,
+                    "messages": prompt,
+                    "temperature": 1,
+                    "top_p": 0.5
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            # 记录token使用情况
+            usage = response_data.get('usage', {})
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            completion_tokens = usage.get('completion_tokens', 0)
+            self.total_input_token += prompt_tokens
+            self.total_output_token += completion_tokens
+            print(f"[InitServer] Host LLM server response received")
+            print(f"[InitServer] Input tokens: {prompt_tokens}")
+            print(f"[InitServer] Output tokens: {completion_tokens}")
+            return content
+        except Exception as e:
+            print(f"[InitServer] Error calling host LLM server: {e}")
+            return None
     
     def compare_commands_with_lists(self) -> dict:
         """
@@ -2962,90 +3506,14 @@ brctl addbr br0
         
         return filtered_removed_commands, filtered_retained_commands
 
-    def update_whitelist_and_blacklist(self, removed_commands, retained_commands):
-        """
-        更新白名单和黑名单
-        """
-        # print("Updating whitelist and blacklist in accesscontrol_server")
-        
-        # 如果被移除的命令在当前白名单中，则从白名单中移除，并加入到黑名单
-        for cmd in removed_commands:
-            cmd_name = cmd.split()[0] if cmd.strip() else ""
-            if not cmd_name:
-                continue
-                
-            # 跳过不可被更改的命令
-            if cmd_name in self.IMMUTABLE_WHITELIST or cmd_name in self.IMMUTABLE_BLACKLIST:
-                # print(f"[InitServer] Skipping immutable command: {cmd}")
-                continue
-            
-            # 跳过以.sh结尾的文件
-            if cmd_name.endswith('.sh'):
-                # print(f"[InitServer] Skipping .sh file: {cmd}")
-                continue
-                
-            if cmd in self.whitelist:
-                response = self._call_accesscontrol_client("whitelist_remove", cmd)
-                if response.get("status") == "ok":
-                    # print(f"[InitServer] Removed from whitelist: {cmd}")
-                    self.whitelist.discard(cmd)
-                else:
-                    print(f"[InitServer] [!] Failed to remove {cmd} from whitelist: {response.get('message', 'Unknown error')}")
-                    return False
-                
-            if cmd not in self.blacklist:
-                response = self._call_accesscontrol_client("blacklist_add", cmd)
-                if response.get("status") == "ok":
-                    # print(f"[InitServer] Added to blacklist: {cmd}")
-                    self.blacklist.add(cmd)
-                else:
-                    print(f"[InitServer] [!] Failed to add {cmd} to blacklist: {response.get('message', 'Unknown error')}")
-                    return False
-        
-        # 如果被保留的命令在当前黑名单中，则从黑名单中移除，并加入到白名单
-        for cmd in retained_commands:
-            cmd_name = cmd.split()[0] if cmd.strip() else ""
-            if not cmd_name:
-                continue
-                
-            # 跳过不可被更改的命令
-            if cmd_name in self.IMMUTABLE_WHITELIST or cmd_name in self.IMMUTABLE_BLACKLIST:
-                # print(f"[InitServer] Skipping immutable command: {cmd}")
-                continue
-            
-            # 跳过以.sh结尾的文件
-            if cmd_name.endswith('.sh'):
-                # print(f"[InitServer] Skipping .sh file: {cmd}")
-                continue
-                
-            if cmd in self.blacklist:
-                response = self._call_accesscontrol_client("blacklist_remove", cmd)
-                if response.get("status") == "ok":
-                    print(f"[InitServer] Removed from blacklist: {cmd}")
-                    self.blacklist.discard(cmd)
-                else:
-                    print(f"[InitServer] [!] Failed to remove {cmd} from blacklist: {response.get('message', 'Unknown error')}")
-                    return False
-                
-            if cmd not in self.whitelist:
-                response = self._call_accesscontrol_client("whitelist_add", cmd)
-                if response.get("status") == "ok":
-                    # print(f"[InitServer] Added to whitelist: {cmd}")
-                    self.whitelist.add(cmd)
-                else:
-                    print(f"[InitServer] [!] Failed to add {cmd} to whitelist: {response.get('message', 'Unknown error')}")
-                    return False       
-        
-        # print(f"[InitServer] Whitelist updated: {len(self.whitelist)} entries")
-        # print(f"[InitServer] Blacklist updated: {len(self.blacklist)} entries")
-        return True
 
-    def filter_init_script(self):
+
+    def filter_init_script(self, script_path):
         """
         过滤init脚本
         """
         try:
-            real_init_script_path = os.path.join(self.fs_path, self.init_script_path.lstrip("/"))
+            real_init_script_path = os.path.join(self.fs_path, script_path.lstrip("/"))
             # 使用errors='ignore'选项读取文件，忽略编码错误
             with open(real_init_script_path, 'r', encoding='utf-8', errors='ignore') as f:
                 init_script = f.read()
@@ -3061,9 +3529,7 @@ brctl addbr br0
             while num_try <= self.try_max_num:
                 num_try += 1
                 
-                # print(f"[InitServer] Calling Qwen API for the {num_try}th time")
-                
-                start_time = time.time()
+                start_time = time.monotonic()
                 
                 # 增加LLM请求计数
                 with self.llm_request_lock:
@@ -3083,7 +3549,7 @@ brctl addbr br0
                         top_p=0.5,
                     )
                     
-                    end_time = time.time()
+                    end_time = time.monotonic()
                     llm_time = end_time - start_time
                     
                     # 记录token使用情况
@@ -3112,22 +3578,28 @@ brctl addbr br0
                     print(f"[InitServer] Rate limit error: {e}")
                     print(f"[InitServer] Too many requests, waiting before retry...")
                     response_content = ""  # 清空回复内容，以便进行下一次尝试
-                    time.sleep(2)  # 速率限制，等待2秒后重试
+                    time.sleep(3)  # 速率限制，等待2秒后重试
                 except APIConnectionError as e:
                     print(f"[InitServer] Connection error: {e}")
-                    print(f"[InitServer] Network issue, retrying...")
-                    response_content = ""  # 清空回复内容，以便进行下一次尝试
-                    time.sleep(1)  # 连接错误，等待1秒后重试
+                    # print(f"[InitServer] Network issue, trying host LLM server...")
+                    # # 尝试使用host LLM服务
+                    # host_response = self.call_host_llm(prompt)
+                    # if host_response:
+                    #     response_content = host_response
+                    #     break
+                    # # 如果host LLM服务也失败，继续重试
+                    # response_content = ""  # 清空回复内容，以便进行下一次尝试
+                    time.sleep(3)  # 连接错误，等待1秒后重试
                 except APIError as e:
                     print(f"[InitServer] API error: {e}")
                     print(f"[InitServer] Server error, retrying...")
                     response_content = ""  # 清空回复内容，以便进行下一次尝试
-                    time.sleep(1)  # API错误，等待1秒后重试
+                    time.sleep(3)  # API错误，等待1秒后重试
                 except Exception as e:
                     print(f"[InitServer] Unexpected error: {e}")
                     print(f"[InitServer] Unknown error, retrying...")
                     response_content = ""  # 清空回复内容，以便进行下一次尝试
-                    time.sleep(1)  # 未知错误，等待1秒后重试
+                    time.sleep(3)  # 未知错误，等待1秒后重试
                 finally:
                     # 减少LLM请求计数
                     with self.llm_request_lock:
@@ -3147,55 +3619,34 @@ brctl addbr br0
             # 删除原文件并写入新内容
             if os.path.exists(real_init_script_path):
                 os.remove(real_init_script_path)
-                # print(f"[InitServer] Deleted original init script: {real_init_script_path}")
             
             # print(f"[InitServer] Writing new init script to {real_init_script_path}")
             with open(real_init_script_path, 'w', encoding='utf-8') as f:
                 f.write(response_content)
             
-            # 复制过滤后的脚本到容器中
-            try:
-                tar_stream = io.BytesIO()
-                with tarfile.open(fileobj=tar_stream, mode='w') as tar:
-                    tar.add(real_init_script_path, arcname=os.path.basename(self.init_script_path))
-                tar_stream.seek(0)
-                docker_path = os.path.join(self.container_fs_path, os.path.dirname(self.init_script_path))
-                # 复制到容器中的对应路径
-                self.container.put_archive(path=docker_path, data=tar_stream.read())
-                # print(f"[InitServer] Successfully copied filtered init script to container")
-            except Exception as e:
-                print(f"[InitServer] Failed to copy filtered init script to container: {e}")
+            # 不需要将过滤后的脚本复制回容器中，直接替换fs_path中的文件即可
                 
             # 解析新脚本
-            # print("[InitServer] Parsing LLM-generated init script")
             try:
-                parse_success = self.parse_init_script()
+                parse_success = self.parse_init_script(script_path)
                 
-                if parse_success:
-                    # 比较原始脚本和新脚本
-                    removed_commands, retained_commands = self.compare_original_and_new_commands()
-                    
-                    # 更新白名单和黑名单
-                    self.update_whitelist_and_blacklist(removed_commands, retained_commands)
-                else:
+                if not parse_success:
                     print(f"[InitServer] [!] Failed to parse LLM-generated script")
-                    print(f"[InitServer] [!] Continuing without updating whitelist/blacklist")
             except Exception as e:
-                print(f"[InitServer] [!] Failed to parse or compare scripts: {e}")
-                print(f"[InitServer] [!] Continuing without updating whitelist/blacklist")
+                print(f"[InitServer] [!] Failed to parse script: {e}")
         except Exception as e:
             print(f"[InitServer] [!] Error in filter_init_script: {e}")
             print(f"[InitServer] [!] Continuing service operation")
-
-    def resolve_init_script_path(self):
+            
+    def resolve_init_script_path(self, script_path):
         """
         解析并转换init脚本路径
         
         Returns:
-            str: 成功返回True，失败返回错误信息
+            str: 成功返回解析后的脚本路径，失败返回错误信息
         """
         # 在self.fs_path中查找init脚本
-        real_init_script_path = os.path.join(self.fs_path, self.init_script_path.lstrip("/"))
+        real_init_script_path = os.path.join(self.fs_path, script_path.lstrip("/"))
         found_files = []
         
         # 先处理软连接，获取真实文件路径
@@ -3221,12 +3672,12 @@ brctl addbr br0
         if os.path.exists(resolved_path):
             found_files = [resolved_path]
         else:
-            print(f"[InitServer] [!] File not found: Init script <{resolved_path}>")
+            print(f"[InitServer] [!] File not found: Init script {resolved_path}")
             # 在self.fs_path中搜索匹配的文件
             import mimetypes
             
             # 获取要查找的文件名
-            target_filename = os.path.basename(self.init_script_path)
+            target_filename = os.path.basename(script_path)
             
             # 在self.fs_path中递归搜索所有文件
             for root, dirs, files in os.walk(self.fs_path):
@@ -3245,6 +3696,12 @@ brctl addbr br0
                             print(f"[InitServer] [✓] Resolved symlink to: {temp_resolved} (attempt {temp_attempt})")
                         if temp_attempt < max_resolve_attempts:
                             found_files.append(temp_resolved)
+                            # 找到文件后可以考虑提前结束搜索
+                            if len(found_files) >= 5:  # 限制找到的文件数量
+                                print(f"[InitServer] [✓] Found {len(found_files)} files, stopping search")
+                                break
+                if len(found_files) >= 5:
+                    break
             
             if found_files:
                 # 如果只找到一个文件则直接使用，不用检查
@@ -3282,10 +3739,10 @@ brctl addbr br0
         
         # 更新为解析后的真实路径
         real_init_script_path = resolved_path
-        self.init_script_path = os.path.relpath(real_init_script_path, self.fs_path)
-        return True
+        script_path = os.path.relpath(real_init_script_path, self.fs_path)
+        return script_path
     
-    def script_process(self):
+    def script_process(self, script_path):
         """
         处理init脚本
         """
@@ -3293,7 +3750,6 @@ brctl addbr br0
         runtime_dirs = ['tmp/', 'var/', 'run/', 'mnt/', 'media/', 'dev/', 'sys/', 'proc/']
         runtime_paths = ['/tmp/', '/var/', '/run/', '/mnt/', '/media/', '/dev/', '/sys/', '/proc/']
         
-        script_path = self.init_script_path
         skip_filter = False
         for dir_prefix in runtime_dirs:
             if script_path.startswith(dir_prefix):
@@ -3311,196 +3767,224 @@ brctl addbr br0
             return "success"
         
         # 解析并转换init脚本路径
-        result = self.resolve_init_script_path()
-        if result != True:
+        resolved_script_path = self.resolve_init_script_path(script_path)
+        if resolved_script_path == "parse_init_script_error":
             return "not_found_init_script"
         
         # 检查脚本是否已经被LLM过滤过
-        script_path = self.init_script_path
-        
-        if script_path in self.filtered_scripts:
-            print(f"[InitServer] Script {script_path} has been filtered by LLM before, skipping LLM filtering")
+        if resolved_script_path in self.filtered_scripts:
+            print(f"[InitServer] Script {resolved_script_path} has been filtered by LLM before, skipping LLM filtering")
             return "success"
         
-        # 解析原始脚本并保存原始shell指令集合
-        parse_success = self.parse_init_script(save_original=True)
-        
-        # 如果解析成功，加载白名单和黑名单并比较命令
-        if parse_success:
-            # 加载白名单和黑名单
-            if not self.load_whitelist_blacklist("both"):
-                return "accesscontrold_error"
-            
-            # 与白名单和黑名单比较当前shell脚本中命令
-            result = self.compare_commands_with_lists()
-
-            # 如果存在不在白名单和黑名单中的命令，使用LLM过滤
-            if result["not_in_lists"]:
-                # print(f"[InitServer] Commands not in whitelist or blacklist found, using LLM to filter init script")
-                self.filter_init_script()
-                # 添加到已过滤脚本列表
-                self.add_filtered_script(self.init_script_path)
-                return "success"
-            
-            # 如果都是已知命令，且存在黑名单中的命令，则将黑名单写入本地文件，供qemu内部判断是否需要跳过对应命令
-            elif result["in_blacklist"]:
-                print(f"[InitServer] Some commands in blacklist, running init script")
-                return "some_in_blacklist"
-            
-            # 如果全是白名单中的命令，直接运行
-            else:
-                # print(f"[InitServer] All commands in whitelist, running init script")
-                return "success"
-        
-        # 如果解析失败，直接使用LLM进行过滤
-        else:
-            # print(f"[InitServer] Script parsing failed, using LLM to filter init script directly")
-            self.filter_init_script()
-            # 添加到已过滤脚本列表
-            self.add_filtered_script(self.init_script_path)
-            return "success"
+        # 直接使用LLM过滤脚本
+        self.filter_init_script(resolved_script_path)
+        # 添加到已过滤脚本列表
+        self.add_filtered_script(resolved_script_path)
+        return "success"
 
     def check_command_blacklist(self, entry: str) -> str:
         """
-        检查命令是否在黑名单中
+        检查命令是否在预设黑名单中
         """
-        # 首先检查不可被更改的黑名单
+        # 提取entry的basename
+        entry = os.path.basename(entry)
+        
+        # 检查预设的黑名单
         if entry in self.IMMUTABLE_BLACKLIST:
             # print(f"[InitServer] {entry} is in immutable blacklist")
-            return "in_blacklist"
-        
-        # 然后检查常规黑名单
-        if not self.load_whitelist_blacklist("blacklist"):
-            return "accesscontrold_error"
-        
-        if entry in self.blacklist:
-            # print(f"[InitServer] {entry} is in blacklist")
             return "in_blacklist"
         else:
             # print(f"[InitServer] {entry} is not in blacklist")
             return "not_in_blacklist"
 
-    def parse_communication_file(self):
-        """
-        解析通信文件
-        """
-        try:
-            # 从容器中读取通信文件内容
-            exit_code, output = self.container.exec_run(f"cat {self.communication_file}")
-            if exit_code != 0:
-                print(f"[InitServer] Failed to read communication file in container: {output.decode('utf-8', errors='ignore')}")
-                return None, None
-            content = output.decode('utf-8', errors='ignore').strip()
+    # def parse_communication_file(self):
+    #     """
+    #     解析通信文件
+    #     """
+    #     try:
+    #         # 从容器中读取通信文件内容
+    #         exit_code, output = self.container.exec_run(f"cat {self.communication_file}")
+    #         if exit_code != 0:
+    #             print(f"[InitServer] Failed to read communication file in container: {output.decode('utf-8', errors='ignore')}")
+    #             return None, None
+    #         content = output.decode('utf-8', errors='ignore').strip()
             
-            # print(f"[InitServer] Received message: {content}")
+    #         # print(f"[InitServer] Received message: {content}")
             
-            # 解析消息格式：s;消息内容
-            parts = content.split(';', 1)
-            if len(parts) == 2:
-                service_id = parts[0]
-                actual_message = parts[1]
-                return service_id, actual_message
-            else:
-                print(f"[InitServer] [!] Invalid message format: {content}")
-                return None, None
-        except Exception as e:
-            print(f"[InitServer] [!] Parse communication file error: {e}")
-            return None, None
+    #         # 解析消息格式：s;消息内容
+    #         parts = content.split(';', 1)
+    #         if len(parts) == 2:
+    #             service_id = parts[0]
+    #             actual_message = parts[1]
+    #             return service_id, actual_message
+    #         else:
+    #             print(f"[InitServer] [!] Invalid message format: {content}")
+    #             return None, None
+    #     except Exception as e:
+    #         print(f"[InitServer] [!] Parse communication file error: {e}")
+    #         return None, None
 
     def process_communication_file(self):
         """
-        处理通信文件
+        处理通信文件（多线程版本）
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         try:
             # 检查容器是否运行
             if self.container.status != 'running':
                 return
                 
-            # 检查锁文件是否存在
-            exit_code, _ = self.container.exec_run(f"test -f {self.lock_file}")
-            # print(f"[InitServer] lock_file exit_code {exit_code}")
-            if exit_code == 0:
-                return
-            
-            # 检查通信文件是否存在
-            exit_code, _ = self.container.exec_run(f"test -f {self.communication_file}")
-            # print(f"[InitServer] communication_file exit_code {exit_code}")
+            # 查找所有PID-specific的通信文件
+            exit_code, output = self.container.exec_run("ls -f /msg_init_*.txt 2>/dev/null")
             if exit_code != 0:
                 return
+            
+            # 处理每个通信文件
+            files = output.decode('utf-8', errors='ignore').strip().split('\n')
+            pid_queue = Queue()
+            
+            # 收集所有PID
+            for file_path in files:
+                if not file_path:
+                    continue
+                
+                # 提取PID
+                import re
+                match = re.search(r'/msg_init_(\d+)\.txt$', file_path)
+                if not match:
+                    continue
+                
+                pid = match.group(1)
+                pid_queue.put(pid)
+            
+            # 定义工作线程函数
+            def worker():
+                while not pid_queue.empty():
+                    try:
+                        pid = pid_queue.get(block=False)
+                        self._process_single_file(pid)
+                    except Empty:
+                        break
+                    except Exception as e:
+                        print(f"[InitServer] [!] Worker error: {e}")
+                        break
+            
+            # 创建线程池（最大5个线程）
+            threads = []
+            max_threads = min(5, pid_queue.qsize())
+            
+            for i in range(max_threads):
+                thread = threading.Thread(target=worker)
+                threads.append(thread)
+                thread.start()
+            
+            # 等待所有线程完成
+            for thread in threads:
+                thread.join()
+                
+            end_time = time.monotonic()
+            self.script_process_time += end_time - start_time
+                    
         except Exception as e:
             print(f"[InitServer] [!] Check container files error: {e}")
             return
-        
-        # 创建锁文件
-        try:
-            self.container.exec_run(f"touch {self.lock_file}")
-        except Exception as e:
-            print(f"[InitServer] [!] Create lock file failed: {e}")
-            return
-        
-        # 解析通信文件
-        service_id, actual_message = self.parse_communication_file()
-        if not service_id or not actual_message:
-            self.cleanup_files()
-            return
-        
-        # 处理不同类型的请求
-        reply = "unknown_service"
-        if service_id == "e":
-            # print("================================")
-            # print(f"[InitServer] Checking blacklist for: {actual_message}")
-            reply = self.check_command_blacklist(actual_message)
-            end_time = time.time()
-            self.check_blacklist_time += end_time - start_time
-            # print(f"[InitServer] Check blacklist time: {end_time - start_time}")
-        elif service_id == "s":
-            # print("================================")
-            self.init_script_path = actual_message
-            print(f"[InitServer] Processing init script: {self.init_script_path}")
-            reply = self.script_process()
-            end_time = time.time()
-            self.script_process_time += end_time - start_time
-            # print(f"[InitServer] Script process time: {end_time - start_time}")
-        else:
-            print(f"[InitServer] [!] Unknown service: {service_id}")
-        
-        # 写入结果文件
-        try:
-            # 使用sh -c来正确处理重定向
-            exit_code, output = self.container.exec_run(f'sh -c "echo \\"{reply}\\" > {self.result_file}"')
-            # print(f"[InitServer] bash -c \"echo \\\"{reply}\\\" > {self.result_file}\"")
-            if exit_code != 0:
-            #     # 再次确认文件是否成功写入
-            #     chk_exit, chk_out = self.container.exec_run(f"test -f {self.result_file}")
-            #     if chk_exit == 0:
-            #         print(f"[InitServer] Response sent: {reply}")
-            #     else:
-            #         print(f"[InitServer] [!] Result file not found after write: {self.result_file}")
-            # else:
-                print(f"[InitServer] [!] Write result file failed: {output.decode('utf-8', errors='ignore')}")
-        except Exception as e:
-            print(f"[InitServer] [!] Write result file error: {e}")
-        
-        # 清理文件
-        self.cleanup_files()
 
-    def cleanup_files(self):
+    # def _process_single_file(self, pid):
+    #     """
+    #     处理单个通信文件
+    #     """
+    #     comm_file = f"/msg_init_{pid}.txt"
+    #     lock_file = f"/msg_init_{pid}.lock"
+    #     result_file = f"/result_init_{pid}.txt"
+        
+    #     try:
+    #         # 检查锁文件是否存在
+    #         exit_code, _ = self.container.exec_run(f"test -f {lock_file}")
+    #         if exit_code == 0:
+    #             return
+            
+    #         # 创建锁文件
+    #         self.container.exec_run(f"touch {lock_file}")
+            
+    #         # 解析通信文件
+    #         exit_code, output = self.container.exec_run(f"cat {comm_file}")
+    #         if exit_code != 0:
+    #             print(f"[InitServer] Failed to read communication file for PID {pid}: {output.decode('utf-8', errors='ignore')}")
+    #             self._cleanup_files_for_pid(pid)
+    #             return
+            
+    #         content = output.decode('utf-8', errors='ignore').strip()
+            
+    #         # 解析消息格式：s;消息内容
+    #         parts = content.split(';', 1)
+    #         if len(parts) != 2:
+    #             print(f"[InitServer] [!] Invalid message format for PID {pid}: {content}")
+    #             self._cleanup_files_for_pid(pid)
+    #             return
+            
+    #         service_id = parts[0]
+    #         actual_message = parts[1]
+            
+    #         # 处理不同类型的请求
+    #         reply = "unknown_service"
+    #         if service_id == "e":
+    #             reply = self.check_command_blacklist(actual_message)
+    #         elif service_id == "s":
+    #             script_path = actual_message
+    #             print(f"[InitServer] Processing init script: {script_path} for PID {pid}")
+    #             reply = self.script_process(script_path)
+    #         else:
+    #             print(f"[InitServer] [!] Unknown service: {service_id} for PID {pid}")
+            
+    #         # 写入结果文件
+    #         exit_code, output = self.container.exec_run(f'sh -c "echo \\"{reply}\\" > {result_file}"')
+    #         if exit_code != 0:
+    #             print(f"[InitServer] [!] Write result file failed for PID {pid}: {output.decode('utf-8', errors='ignore')}")
+                
+    #     except Exception as e:
+    #         print(f"[InitServer] [!] Error processing file for PID {pid}: {e}")
+    #     finally:
+    #         # 清理文件
+    #         self._cleanup_files_for_pid(pid)
+
+    def _cleanup_files_for_pid(self, pid):
         """
-        清理文件
+        清理指定PID的文件
         """
+        comm_file = f"/msg_init_{pid}.txt"
+        lock_file = f"/msg_init_{pid}.lock"
         try:
             # 删除通信文件
-            exit_code, output = self.container.exec_run(f"rm -f {self.communication_file}")
+            exit_code, output = self.container.exec_run(f"rm -f {comm_file}")
             if exit_code != 0:
-                print(f"[InitServer] [!] Delete communication file failed: {output.decode('utf-8', errors='ignore')}")
+                print(f"[InitServer] [!] Delete communication file failed for PID {pid}: {output.decode('utf-8', errors='ignore')}")
             
             # 删除锁文件
-            exit_code, output = self.container.exec_run(f"rm -f {self.lock_file}")
+            exit_code, output = self.container.exec_run(f"rm -f {lock_file}")
             if exit_code != 0:
-                print(f"[InitServer] [!] Delete lock file failed: {output.decode('utf-8', errors='ignore')}")
+                print(f"[InitServer] [!] Delete lock file failed for PID {pid}: {output.decode('utf-8', errors='ignore')}")
         except Exception as e:
-            print(f"[InitServer] [!] Cleanup files error: {e}")
+            print(f"[InitServer] [!] Cleanup files error for PID {pid}: {e}")
+        
+    # def cleanup_files(self):
+    #     """
+    #     清理文件
+    #     """
+    #     try:
+    #         # 删除通信文件
+    #         exit_code, output = self.container.exec_run(f"rm -f {self.communication_file}")
+    #         if exit_code != 0:
+    #             print(f"[InitServer] [!] Delete communication file failed: {output.decode('utf-8', errors='ignore')}")
+            
+    #         # 删除锁文件
+    #         exit_code, output = self.container.exec_run(f"rm -f {self.lock_file}")
+    #         if exit_code != 0:
+    #             print(f"[InitServer] [!] Delete lock file failed: {output.decode('utf-8', errors='ignore')}")
+            
+    #         # 清理可能存在的PID格式文件
+    #         exit_code, _ = self.container.exec_run("rm -f /msg_init_*.txt /msg_init_*.lock 2>/dev/null")
+    #     except Exception as e:
+    #         print(f"[InitServer] [!] Cleanup files error: {e}")
 
     def stop(self):
         """
@@ -3520,42 +4004,28 @@ brctl addbr br0
             print(f"[InitServer] Still {current_count} LLM requests in progress, waiting...")
             time.sleep(5)
         print("[InitServer] All LLM requests completed")
-
-    def check_accesscontrol_service(self):
-        """
-        检查accesscontrol服务是否开启
-        """
-        print(f"[InitServer] Checking accesscontrol service at {self.host}:{self.port}")
-        try:
-            # 尝试连接到accesscontrol服务
-            with socket.create_connection((self.host, self.port), timeout=5.0):
-                print("[InitServer] accesscontrol service is running")
-                return True
-        except Exception as e:
-            print(f"[InitServer] [!] Failed to connect to accesscontrol service: {e}")
-            return False
-
-    def run(self, interval=1):
-        """
-        运行服务器
-        """
-        # 检查accesscontrol服务是否开启
-        if not self.check_accesscontrol_service():
-            print("[InitServer] [!] accesscontrol service is not running, exiting")
-            return
         
-        print(f"[InitServer] Init Script Server started")
-        
+        # 关闭Docker容器连接
+        self.close()
+    
+    def close(self):
+        """
+        关闭服务器资源，包括Docker容器连接
+        """
         try:
-            while not self.stop_flag:
-                self.process_communication_file()
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\n[InitServer] Init Script Server stopped")
+            if hasattr(self, 'container') and self.container:
+                # 关闭Docker容器连接
+                self.container.client.close()
+                print("[InitServer] Docker container connection closed")
         except Exception as e:
-            print(f"[InitServer] [!] Server error: {e}")
-        finally:
-            print("[InitServer] Init Script Server exited")
+            print(f"[InitServer] [!] Error closing Docker connection: {e}")
+
+    def run(self, interval=0):
+        """
+        运行服务器（已废弃，不再使用实时监控）
+        """
+        print(f"[InitServer] Init Script Server is deprecated, use process_container_files instead")
+        return
 
     def get_total_input_tokens(self):
         """
@@ -3568,3 +4038,130 @@ brctl addbr br0
         获取总输出token数
         """
         return self.total_output_token
+    
+    def process_container_files(self):
+        """
+        处理容器文件，在容器运行结束后检查文件获取脚本路径，在容器外进行LLM推理
+        """
+        print("[InitServer] Processing container files for init scripts")
+        
+        try:
+            # 打印self.container_fs_path下的所有文件
+            # print(f"[InitServer] Container fs path: {self.container_fs_path}")
+            exit_code, fs_files = self.container.exec_run(["sh", "-c", f"ls -la {self.container_fs_path} 2>/dev/null"])
+            if exit_code != 0:
+            #     print(f"[InitServer] Files in container_fs_path:\n{fs_files.decode('utf-8', errors='ignore')}")
+            # else:
+                print(f"[InitServer] Failed to list files in container_fs_path")
+            
+            # 查找所有通信文件，使用container_fs_path作为前缀
+            msg_init_pattern = os.path.join(self.container_fs_path, "msg_init_*.txt")
+            exit_code, output = self.container.exec_run(["sh", "-c", f"ls -f {msg_init_pattern} 2>/dev/null"])
+
+            if exit_code != 0:
+                print("[InitServer] No communication files found in container")
+                return
+            
+            # 处理每个通信文件
+            files = output.decode('utf-8', errors='ignore').strip().split('\n')
+            processed_scripts = []
+            
+            # 使用队列和多线程处理文件
+            import queue
+            import threading
+            
+            file_queue = queue.Queue()
+            result_queue = queue.Queue()
+            
+            # 用于跟踪已经处理过的脚本路径
+            processed_script_paths = set()
+            
+            # 从fs_path加载已处理的脚本路径
+            processed_scripts_file = os.path.join(self.fs_path, "processed_init_scripts.txt")
+            if os.path.exists(processed_scripts_file):
+                try:
+                    with open(processed_scripts_file, "r") as f:
+                        for line in f:
+                            script_path = line.strip()
+                            if script_path:
+                                processed_script_paths.add(script_path)
+                    print(f"[InitServer] Loaded {len(processed_script_paths)} processed scripts from {processed_scripts_file}")
+                except Exception as e:
+                    print(f"[InitServer] Error loading processed scripts: {e}")
+            
+            # 线程安全的锁
+            processed_paths_lock = threading.Lock()
+            
+            # 填充队列
+            for file_path in files:
+                if file_path:
+                    file_queue.put(file_path)
+            
+            # 定义工作线程函数
+            def worker():
+                while not file_queue.empty():
+                    try:
+                        file_path = file_queue.get(block=False)
+                        
+                        # 读取通信文件，文件内容直接是脚本路径
+                        exit_code, output = self.container.exec_run(f"cat {file_path}")
+                        if exit_code != 0:
+                            print(f"[InitServer] Failed to read communication file: {file_path}")
+                            continue
+                        
+                        script_path = output.decode('utf-8', errors='ignore').strip()
+                        
+                        if not script_path:
+                            print(f"[InitServer] Empty script path in file: {file_path}")
+                            continue
+                        
+                        # 检查脚本路径是否已经被处理过
+                        with processed_paths_lock:
+                            if script_path in processed_script_paths:
+                                print(f"[InitServer] Script {script_path} already processed, skipping")
+                                continue
+                            # 添加到已处理集合
+                            processed_script_paths.add(script_path)
+                        
+                        # 处理脚本路径
+                        print(f"[InitServer] Processing init script: {script_path}")
+                        result = self.script_process(script_path)
+                        result_queue.put((script_path, result))
+                    except queue.Empty:
+                        break
+                    except Exception as e:
+                        print(f"[InitServer] [!] Error processing file {file_path}: {e}")
+                        continue
+            
+            # 创建线程池（最大3个线程）
+            threads = []
+            max_threads = min(3, file_queue.qsize())
+            
+            for i in range(max_threads):
+                thread = threading.Thread(target=worker)
+                threads.append(thread)
+                thread.start()
+            
+            # 等待所有线程完成
+            for thread in threads:
+                thread.join()
+            
+            # 收集结果
+            while not result_queue.empty():
+                processed_scripts.append(result_queue.get())
+            
+            # 持久化已处理的脚本路径到fs_path
+            processed_scripts_file = os.path.join(self.fs_path, "processed_init_scripts.txt")
+            try:
+                with open(processed_scripts_file, "w") as f:
+                    for script_path in processed_script_paths:
+                        f.write(f"{script_path}\n")
+                print(f"[InitServer] Saved {len(processed_script_paths)} processed scripts to {processed_scripts_file}")
+            except Exception as e:
+                print(f"[InitServer] Error saving processed scripts: {e}")
+            
+            print(f"[InitServer] Processed {len(processed_scripts)} init scripts")
+            return processed_scripts
+        except Exception as e:
+            print(f"[InitServer] [!] Error processing container files: {e}")
+            return []

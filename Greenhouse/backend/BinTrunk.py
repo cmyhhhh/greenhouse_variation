@@ -590,7 +590,7 @@ class BinTrunk:
 
     def highlight_trace_and_dump_graph(self, trace, mark=[]):
         print("Drawing dot graph for %s" % self.binary_name)
-        start_time = time.time()
+        start_time = time.monotonic()
         dot_graph = networkx.nx_pydot.to_pydot(self.graph)
 
         self.color_exits(dot_graph)
@@ -608,7 +608,7 @@ class BinTrunk:
             graph_name = '%s_full' % self.binary_name
         dot_graph.write(graph_name+".dot")
 
-        end_time = time.time()
+        end_time = time.monotonic()
         time_taken = end_time - start_time
         print("...done.")
         print("Drawing Graph + Trace for %s took %f seconds" % (self.binary_name, time_taken))
@@ -616,7 +616,7 @@ class BinTrunk:
 
     def dump_graph(self):
         print("Drawing .dot graph for %s" % self.binary_name)
-        start_time = time.time()
+        start_time = time.monotonic()
         dot_graph = networkx.nx_pydot.to_pydot(self.graph)
         print("done converting!")
         self.color_exits(dot_graph)
@@ -627,7 +627,7 @@ class BinTrunk:
 
         dot_graph.write_dot(graph_name+".dot")
 
-        end_time = time.time()
+        end_time = time.monotonic()
         time_taken = end_time - start_time
         print("...done.")
         print("Drawing Graph for %s took %f seconds" % (self.binary_name, time_taken))

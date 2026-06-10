@@ -193,7 +193,7 @@ function run_emulation()
         # ================================
         # infer network interface
         # ================================
-        for TRIES in 1 2 3; do
+        for TRIES in 1 2; do
             t_start="$(date -u +%s.%N)"
             echo "[*] $TRIES: infer network start!!!"
             # TIMEOUT is set in "firmae.config". This TIMEOUT is used for initial
@@ -288,6 +288,7 @@ function run_emulation()
         if ($PING_RESULT); then
             echo -e "[\033[32m+\033[0m] Run debug!"
             IP=`cat ${WORK_DIR}/ip`
+            echo "[*] Web IP: ${IP}"
             ./scratch/$IID/run_debug.sh &
             check_network ${IP} true
 

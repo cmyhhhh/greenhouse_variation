@@ -773,7 +773,16 @@ def main():
                         help="Print debug information")
     result = parser.parse_args()
 
-    if psql_check(result.sql):
+    # 检查是否有-sql参数
+    if result.sql:
+        # 如果有-sql参数，只有当数据库连接成功时才运行
+        if psql_check(result.sql):
+            extract = Extractor(result.input, result.output, result.rootfs,
+                                result.kernel, result.parallel, result.sql,
+                                result.brand, result.debug)
+            extract.extract()
+    else:
+        # 如果没有-sql参数，直接运行
         extract = Extractor(result.input, result.output, result.rootfs,
                             result.kernel, result.parallel, result.sql,
                             result.brand, result.debug)

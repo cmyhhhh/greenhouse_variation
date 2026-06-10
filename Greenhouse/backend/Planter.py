@@ -2,18 +2,306 @@ from telnetlib import IP
 from . import *
 from .LLMServer import NvramServer
 
-import os, shutil, stat, getpass
+import os, shutil, stat, getpass, glob
 import subprocess
 from subprocess import Popen, PIPE
 import pathlib
 import ipaddress
 import re
 import time
-import ipaddress
 import string
 import angr
 import ifaddr
 
+def remove_markdown_comments(code):
+    """
+    移除Markdown注释
+    """
+    pattern = re.compile(r"^```.*$", re.MULTILINE)
+    cleaned_content = re.sub(pattern, "", code)
+    pattern = re.compile(r"^\s*$(?:\r?\n)?", re.MULTILINE)
+    cleaned_content = re.sub(pattern, "", cleaned_content)
+    if cleaned_content and cleaned_content[-1] == '\n':
+        cleaned_content = cleaned_content[:-1]
+    return cleaned_content
+
+
+def llm_evaluate_init_candidates(candidates, fs_path):
+    """Evaluate init candidates using LLM and return the optimal candidate"""
+    try:
+        from openai import OpenAI
+        import time
+        
+        # Build candidate information
+        candidates_info = []
+        for i, candidate in enumerate(candidates, 1):
+            # Resolve symlink to get real file path
+            real_path = candidate
+            # Use LLMServer-style symlink resolution with circular link protection
+            max_resolve_attempts = 10  # Prevent circular symlinks
+            attempt = 0
+            
+            while os.path.islink(real_path) and attempt < max_resolve_attempts:
+                attempt += 1
+                try:
+                    link_target = os.readlink(real_path)
+                    # Always treat link target as relative to firmware filesystem root
+                    link_target_in_fs = link_target.lstrip('/')
+                    real_path = os.path.join(fs_path, link_target_in_fs)
+                    # Normalize path to avoid ../ in path
+                    real_path = os.path.normpath(real_path)
+                except Exception:
+                    break
+            
+            if attempt >= max_resolve_attempts:
+                print(f"[LLM Init Evaluation] Too many symlink resolution attempts, possible circular symlink: {candidate}")
+            
+            found_files = []
+            
+            # Check if resolved path exists
+            if os.path.exists(real_path) and not os.path.isdir(real_path):
+                found_files = [real_path]
+            else:
+                print(f"[LLM Init Evaluation] File not found: {real_path}")
+                # Search for matching files in fs_path
+                import mimetypes
+                
+                # Get target filename
+                target_filename = os.path.basename(candidate)
+                
+                # Recursively search all files in fs_path
+                for root, dirs, files in os.walk(fs_path):
+                    for file in files:
+                        if file == target_filename:
+                            full_path = os.path.join(root, file)
+                            # Handle symlinks for found files
+                            temp_resolved = full_path
+                            temp_attempt = 0
+                            while os.path.islink(temp_resolved) and temp_attempt < max_resolve_attempts:
+                                temp_attempt += 1
+                                try:
+                                    temp_link_target = os.readlink(temp_resolved)
+                                    temp_link_target_in_fs = temp_link_target.lstrip('/')
+                                    temp_resolved = os.path.join(fs_path, temp_link_target_in_fs)
+                                    temp_resolved = os.path.normpath(temp_resolved)
+                                except Exception:
+                                    break
+                            if temp_attempt < max_resolve_attempts:
+                                found_files.append(temp_resolved)
+                
+                if found_files:
+                    # If only one file found, use it directly
+                    if len(found_files) == 1:
+                        real_path = found_files[0]
+                        print(f"[LLM Init Evaluation] Found single file: {real_path}")
+                    else:
+                        # Filter text and ELF files
+                        text_files = []
+                        elf_files = []
+                        
+                        for file_path in found_files:
+                            # Check if it's an ELF file
+                            try:
+                                result = subprocess.run(["file", file_path], capture_output=True, text=True)
+                                file_info = result.stdout.lower()
+                                if "elf" in file_info:
+                                    elf_files.append(file_path)
+                                else:
+                                    # Check if it's a text file
+                                    # Guess file type using mimetypes
+                                    mime_type, _ = mimetypes.guess_type(file_path)
+                                    if mime_type and mime_type.startswith('text/'):
+                                        text_files.append(file_path)
+                                    else:
+                                        # Try to read file content to determine if it's text
+                                        try:
+                                            with open(file_path, 'r') as f:
+                                                f.read(1024)  # Only read first 1024 bytes
+                                            text_files.append(file_path)
+                                        except UnicodeDecodeError:
+                                            continue
+                            except Exception:
+                                continue
+                        if elf_files:
+                            real_path = elf_files[0]
+                            print(f"[LLM Init Evaluation] Found ELF file: {real_path}")
+                        elif text_files:
+                            real_path = text_files[0]
+                            print(f"[LLM Init Evaluation] Found text file: {real_path}")
+                        else:
+                            # No suitable files found, select first found file
+                            real_path = found_files[0]
+                            print(f"[LLM Init Evaluation] Found file: {real_path}")
+                else:
+                    print(f"[LLM Init Evaluation] No matching files found in {fs_path}")
+            
+            # Get relative path for prompt (without fs_path)
+            relative_path = real_path.replace(fs_path, "").lstrip('/')
+            if not relative_path:
+                continue
+            
+            info = {
+                "index": i,
+                "path": candidate,
+                "relative_path": relative_path,
+                "content": "",
+                "is_elf": False
+            }
+            
+            # Get file content or relevant information
+            if found_files and os.path.exists(real_path) and not os.path.isdir(real_path):
+                try:
+                    # Check if it's a text file
+                    result = subprocess.run(["file", real_path], capture_output=True, text=True)
+                    file_info = result.stdout.lower()
+                    
+                    if "text" in file_info or "script" in file_info:
+                        # For text files, read content
+                        with open(real_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            # Limit content length to avoid long prompt
+                            if len(content) > 5000:
+                                info["content"] = content[:5000] + "\n[Content too long, truncated]"
+                            else:
+                                info["content"] = content
+                    elif "elf" in file_info:
+                        # For ELF files, extract key information
+                        info["is_elf"] = True
+                        elf_info = []
+                        
+                        # Use strings to extract key strings, limit output
+                        try:
+                            strings_result = subprocess.run(
+                                ["strings", "-n", "6", real_path], 
+                                capture_output=True, text=True, timeout=5
+                            )
+                            # Filter and extract key strings
+                            strings_output = strings_result.stdout.strip().split('\n')
+                            # Filter strings related to init
+                            init_related_strings = [s for s in strings_output if any(keyword in s.lower() for keyword in ['init', 'start', 'boot', 'service', 'rc', 'system', 'process', 'rcS', 'profile'])]
+                            # Get non-empty strings
+                            non_empty_strings = [s for s in strings_output if s.strip()]
+                            # Prioritize related strings, supplement with others if less than 100
+                            selected_strings = init_related_strings.copy()
+                            if len(selected_strings) < 100:
+                                # Add other non-related strings, avoid duplicates
+                                for s in non_empty_strings:
+                                    if s not in selected_strings and len(selected_strings) < 100:
+                                        selected_strings.append(s)
+                            # Take maximum 100 strings
+                            selected_strings = selected_strings[:100]
+                            if selected_strings:
+                                elf_info.append("Key strings:\n" + "\n".join(selected_strings))
+                        except Exception:
+                            pass
+                        
+                        # Use readelf to extract function names, limit output
+                        try:
+                            readelf_result = subprocess.run(
+                                ["readelf", "-s", real_path], 
+                                capture_output=True, text=True, timeout=5
+                            )
+                            # Extract function names (only关注FUNC type symbols)
+                            readelf_output = readelf_result.stdout.strip().split('\n')
+                            function_names = []
+                            for line in readelf_output:
+                                if len(function_names) >= 100:
+                                    break
+                                # Parse readelf output, extract function names
+                                parts = line.split()
+                                if len(parts) >= 8 and parts[3] == 'FUNC':
+                                    func_name = parts[7]
+                                    if func_name not in function_names:
+                                        function_names.append(func_name)
+                            if function_names:
+                                elf_info.append("Function names:\n" + "\n".join(function_names[:100]))
+                        except Exception:
+                            pass
+                        
+                        if elf_info:
+                            info["content"] = "[ELF file information]\n" + "\n".join(elf_info)
+                        else:
+                            info["content"] = "[ELF file, unable to extract key information]"
+                    else:
+                        info["content"] = "[Other file type, unable to analyze]"
+                except Exception:
+                    info["content"] = "[Unable to read file content]"
+            
+            candidates_info.append(info)
+        
+        # Build prompt
+        prompt = [
+            {
+                "role": "system",
+                "content": "You are a firmware analysis expert specializing in evaluating initialization programs for embedded devices. Based on the provided information, please select the optimal init program candidate. Focus on the file's functional completeness and ability to boot the system."
+            },
+            {
+                "role": "user",
+                "content": "Please analyze the following init program candidates, select the optimal one:\n\n"
+            }
+        ]
+        
+        # Add candidate information
+        for info in candidates_info:
+            candidate_content = f"Candidate {info['index']}:\n"
+            candidate_content += f"- Path: /{info['relative_path']}\n"
+            if info['content']:
+                candidate_content += f"- Analysis information:\n{info['content']}\n"
+            prompt[1]["content"] += candidate_content + "\n"
+        
+        # Add evaluation criteria
+        prompt[1]["content"] += "Please evaluate based on the following criteria:\n"
+        prompt[1]["content"] += "1. Functionality: Can it fully start system services and initialization processes?\n"
+        prompt[1]["content"] += "2. Completeness: Does it include necessary startup steps (such as mounting filesystems, starting network, etc.)?\n"
+        prompt[1]["content"] += "3. Reasonableness: Does it conform to the boot process of embedded devices?\n"
+        prompt[1]["content"] += "\nPlease select the optimal init program. DO NOT provide any explanation or reasoning. Simply output the path of the optimal candidate on a single line.\n"
+        prompt[1]["content"] += "\nExample output:\n"
+        prompt[1]["content"] += "/sbin/init"
+        
+        # Initialize OpenAI client
+        client = OpenAI(
+            api_key="sk-o20HTjWDHvtm25HPmjfWgkrOdRDH79bXLRA3UGZDFPXTTYL5",
+            base_url="https://api.vectorengine.ai/v1",
+        )
+        
+        # 调用LLM
+        response = client.chat.completions.create(
+            model="deepseek-v3.2",
+            messages=prompt,
+            temperature=1,
+            top_p=0.5,
+        )
+        
+        # 处理响应
+        response_content = response.choices[0].message.content
+        # 移除Markdown注释
+        response_content = remove_markdown_comments(response_content)
+        print("[LLM Init Evaluation] " + "=" * 20 + "LLM Response" + "=" * 20)
+        print(f"[LLM Init Evaluation] {response_content}")
+        
+        # 提取最优候选路径
+        lines = response_content.strip().split('\n')
+        best_candidate = None
+        
+        # 尝试从最后几行中提取路径
+        for line in reversed(lines):
+            line = line.strip()
+            # 检查是否是有效的文件路径
+            if line:
+                # 尝试在路径前加上 fs_path 检查
+                full_path = os.path.join(fs_path, line.lstrip('/'))
+                if os.path.exists(full_path):
+                    best_candidate = full_path
+                    break
+        
+        # 检查返回的路径是否以 fs_path 开头，如果不是，加上 fs_path
+        if best_candidate and not best_candidate.startswith(fs_path):
+            best_candidate = os.path.join(fs_path, best_candidate.lstrip('/'))
+        
+        return best_candidate
+    except Exception as e:
+        print(f"[LLM Init Evaluation] Error: {e}")
+        return None
 
 
 WEBROOTS = ["www", "www.eng" "web", "webs"]
@@ -53,12 +341,16 @@ ARCH_MAP = {"arm": "qemu-arm-static",
 RESERVED_IPS = ["0.0.0.0", "127.0.0.1", "1.1.1.1", "1.0.0.1"]
 PORTS_BLACKLIST = ['0', '22']
 MAC_NVRAM_KEYS = ["lan_hwaddr"]
-POTENTIAL_INIT = ["preinitmt", "preinit","rcs", "rc", "profile"]
+POTENTIAL_INIT = ["/sbin/preinit", "/bin/init","/sbin/init", "/etc/init", "/sbin/rc", 
+                  "/etc/init.d/rcS", "/usr/etc/rcS", "/etc/system/sysinit", "/sbin/rc", "/etc/init.d/rc"
+                  "/sbin/rcd", "/sbin/procd", "/sbin/rc_app/rc_apps"]
+POTENTIAL_INIT_BASENAME = ["preinitmt", "preinit","rcs", "rc", "profile", "sysinit", "rc_apps", "rcd", "procd"]
 
 class Fixer():
-    def __init__(self, qemu_src_path, gh_path, scripts_path, brand, baseline_mode):
+    def __init__(self, qemu_src_path, gh_path, scripts_path, brand, baseline_mode, no_services=False):
 
         self.qemu_src_path = qemu_src_path
+        self.qemu_src_path_ori = qemu_src_path + "_ori"  # 在路径后面加上 _ori 后缀
         self.qemu_run_path = ""
         self.scripts_path = scripts_path
         self.gh_path = gh_path
@@ -72,6 +364,7 @@ class Fixer():
         self.brand = brand
         self.clib = "glibc" # default
         self.baseline_mode = baseline_mode
+        self.no_services = no_services
         self.nvram_server = None
         self.found_funcs = []
         self.binary_path = None
@@ -88,6 +381,21 @@ class Fixer():
             found_funcs: 在二进制文件中找到的 nvram 函数名列表
         """
         self.found_funcs = found_funcs
+        # 初始化 nvram_server
+        if found_funcs and self.binary_path and self.fs_path and not self.nvram_server and not self.no_services:
+            try:
+                print("    - initializing NvramServer for value prediction")
+                self.nvram_server = NvramServer(
+                    binary_path=self.binary_path,
+                    fs_path=self.fs_path
+                )
+                # 设置找到的 nvram 函数名
+                print(f"    - setting found nvram functions: {', '.join(found_funcs)}")
+                self.nvram_server.set_found_funcs(found_funcs)
+            except Exception as e:
+                print(f"    ! failed to initialize NvramServer: {e}")
+        elif self.no_services:
+            print("    - NvramServer is disabled due to --no_services flag")
 
     def initial_setup(self, fs_path, binary_path):
 
@@ -241,10 +549,25 @@ class Fixer():
             shutil.copytree(webroot_path, dest, symlinks=True)
             print("Created", dest)
 
-    def find_library(self, libname, fs_path, resolve_symlinks=True, skip=[]):
+    def find_library(self, libname, fs_path, resolve_symlinks=True, skip=[], file_cache=None):
+        # 优先使用缓存
+        if file_cache is not None:
+            print("    - [Cache] Searching for library %s in file cache" % libname)
+            for filename, paths in file_cache.items():
+                # 对于库文件，允许版本化匹配
+                if filename == libname or (libname.endswith('.so') and filename.startswith(libname)):
+                    print("    - [Cache] Found library %s in file cache" % filename)
+                    for lib_path in paths:
+                        if lib_path not in skip and os.path.exists(lib_path):
+                            print("    - [Cache] Using cached library: %s" % lib_path)
+                            return lib_path
+        
+        # 缓存未命中时，使用原始方法
+        print("    - [Cache] Cache miss for library %s, using original method" % libname)
         for root, dirs, files in os.walk(fs_path):
             for f in files:
-                if f.startswith(libname):
+                # 对于库文件，允许版本化匹配
+                if f == libname or (libname.endswith('.so') and f.startswith(libname)):
                     lib_path = os.path.join(root, f)
                     if os.path.islink(lib_path):
                         if resolve_symlinks:
@@ -453,6 +776,13 @@ class Fixer():
         print("    - Copying %s to %s" % (path, target_path))
         Files.copy_file(path, target_path)
 
+        qemu_binary_oir = qemu_binary + "_ori"
+        path_ori = os.path.join(self.qemu_src_path_ori, qemu_binary)
+        target_path_ori = os.path.join(fs_path, qemu_binary_oir)
+
+        print("    - Copying %s to %s" % (path_ori, target_path_ori))
+        Files.copy_file(path_ori, target_path_ori)
+
         return target_path
 
     def setup_custom_libraries(self, fs_path):
@@ -535,21 +865,7 @@ class Fixer():
                 changelog.append("[ROADBLOCK] requires NVRAM VALUE: %s" %  value)
             else:
                 # 使用 NvramServer 推测值
-                if not self.nvram_server:
-                    try:
-                        print("    - initializing NvramServer for value prediction")
-                        self.nvram_server = NvramServer(
-                            binary_path=binary_path,
-                            fs_path=fs_path
-                        )
-                        # 设置找到的 nvram 函数名
-                        if self.found_funcs:
-                            print(f"    - setting found nvram functions: {', '.join(self.found_funcs)}")
-                            self.nvram_server.set_found_funcs(self.found_funcs)
-                    except Exception as e:
-                        print(f"    ! failed to initialize NvramServer: {e}")
-                
-                if self.nvram_server:
+                if self.nvram_server and not self.no_services:
                     try:
                         print(f"    - predicting value for nvram key: {key}")
                         response = self.nvram_server.get_nvram_value(key)
@@ -576,10 +892,8 @@ class Fixer():
                                 changelog.append("[ROADBLOCK] requires NVRAM VALUE: %s" %  value)
                     except Exception as e:
                         print(f"    ! failed to predict nvram value: {e}")
-                
-                if not value:
-                    entry = "%s=\n" % (key)
-                    changelog.append("[ROADBLOCK] requires NVRAM KEY: %s"  % entry)
+                elif self.no_services:
+                    print("    - NvramServer is disabled due to --no_services flag, using empty value")
             
             print("    - adding nvram key: %s=%s" % (key, value))
             if os.path.isdir(key_path):
@@ -608,7 +922,7 @@ class Fixer():
         nvramFile.close()
         
         # 统计 NvramServer 的 token 消耗
-        if self.nvram_server:
+        if self.nvram_server and not self.no_services:
             self.total_input_tokens += self.nvram_server.get_total_input_tokens()
             self.total_output_tokens += self.nvram_server.get_total_output_tokens()
             print(f"NvramServer Token Usage - Input: {self.nvram_server.get_total_input_tokens()}, Output: {self.nvram_server.get_total_output_tokens()}")
@@ -656,14 +970,56 @@ class Fixer():
 
 class Planter():
 
-    def __init__(self, gh_path, scripts_path, qemu_src_path, brand):
+    def __init__(self, gh_path, scripts_path, qemu_src_path, brand, no_services=False):
         self.gh_path = gh_path
         self.gh_templates_path = os.path.join(self.gh_path, "templates")
         self.scripts_path = scripts_path
         self.qemu_src_path = qemu_src_path
         self.fixer = None
         self.brand = brand
+        self.no_services = no_services
         self.indicators = ["/bin/sh", "/bin/busybox"]
+        self.llm_init = ""
+        self.file_cache = None  # 文件系统缓存
+
+    def build_file_cache(self, fs_path):
+        """
+        预扫描文件系统，构建文件缓存
+        """
+        print("[GreenHouse] Building file system cache...")
+        start_time = time.monotonic()
+        
+        file_cache = {}
+        for root, dirs, files in os.walk(fs_path):
+            for f in files:
+                file_path = os.path.join(root, f)
+                # 处理符号链接
+                if os.path.islink(file_path):
+                    try:
+                        resolved_path = str(pathlib.Path(file_path).resolve())
+                        # 确保路径在文件系统内
+                        if not resolved_path.startswith(fs_path):
+                            while resolved_path.startswith("/") or resolved_path.endswith("/"):
+                                resolved_path = resolved_path.strip("/")
+                            resolved_path = os.path.join(fs_path, resolved_path)
+                        file_path = resolved_path
+                    except:
+                        pass
+                
+                # 按文件名缓存，如果存在则跳过
+                filename = os.path.basename(f)
+                if filename not in file_cache:
+                    file_cache[filename] = [file_path]
+                else:
+                    file_path_ori = file_cache[filename]
+                    file_name_ori = os.path.basename(file_path_ori[0])
+                    if file_name_ori != filename or "GHTMPSTORE" in file_path_ori[0]:
+                        file_cache[filename] = [file_path]
+        
+        self.file_cache = file_cache
+        end_time = time.monotonic()
+        print(f"[GreenHouse] File system cache built in {end_time - start_time:.2f} seconds")
+        print(f"[GreenHouse] Cached {len(file_cache)} unique filenames")
 
     def identify_target_folder(self, extracted_path):
         found_fs = ""
@@ -720,10 +1076,6 @@ class Planter():
             binwalk_command.extend(["--preserve-symlinks", "-eMq", img_path, "-C", dir_name])
             subprocess.run(binwalk_command)
             time.sleep(1)
-
-        # # Call kernelInit extraction
-        # if os.path.exists(extracted_path):
-        #     self.extract_kernel_init(img_path, extracted_path)
 
         fs_path = ""
         if fs_path_override != "":
@@ -815,53 +1167,152 @@ class Planter():
                 return True
         return False    
 
-    def get_target_binary_and_init(self, fs_path, rehost_type):
+    def extract_kernel_from_firmware(self, firmware_path, output_dir, firmae_path=None):
+        """
+        从固件中提取内核
+        
+        Args:
+            firmware_path: 固件文件路径
+            output_dir: 输出目录
+            firmae_path: FirmAE的安装路径
+            
+        Returns:
+            提取的内核文件路径
+        """        
+        kernel_path = None
+        # 检查FirmAE的extractor.py是否存在
+        firmae_extractor = os.path.join(firmae_path, "sources", "extractor", "extractor.py")
+            
+        if os.path.exists(firmae_extractor):
+            print(f"    - Using FirmAE extractor to extract kernel")
+            # 使用FirmAE的extractor.py提取内核，添加-sql参数
+            extractor_command = [
+                "python3", firmae_extractor,
+                "-np",  # 禁用并行处理
+                "-nf",  # 只提取内核，不提取文件系统
+                firmware_path,
+                output_dir
+            ]
+            
+            # 执行提取命令
+            subprocess.run(extractor_command, capture_output=True, text=True)
+            
+            # 查找提取的内核文件
+            for file in os.listdir(output_dir):
+                if file.endswith(".kernel"):
+                    kernel_path = os.path.join(output_dir, file)
+                    print(f"    - Extracted kernel using FirmAE extractor: {kernel_path}")
+                    return kernel_path
+            
+        return kernel_path
+
+    def extract_init_from_kernel(self, kernel_path):
+        """
+        从提取的内核中提取init信息
+        
+        Args:
+            kernel_path: 内核文件路径
+            
+        Returns:
+            从内核中提取的init路径列表
+        """
+        init_paths = []
+        
+        if not os.path.exists(kernel_path):
+            print(f"    - Kernel file not found: {kernel_path}")
+            return init_paths
+        
+        try:
+            # 使用strings命令从内核中提取字符串
+            result = subprocess.run(
+                ["strings", kernel_path],
+                capture_output=True,
+                text=True
+            )
+            
+            # 搜索包含"init=/"的字符串
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if "init=/" in line:
+                    # 提取init路径
+                    init_match = re.search(r'init=(/[^\s]+)', line)
+                    if init_match:
+                        init_path = init_match.group(1)
+                        # 移除可能的引号
+                        init_path = init_path.strip('"\'')
+                        init_paths.append(init_path)
+                        print(f"    - Found init path in kernel: {init_path}")
+        except Exception as e:
+            print(f"    - Error extracting init from kernel: {e}")
+        
+        # 去重
+        return list(set(init_paths))
+
+    def get_init(self, fs_path, kernel_path=None):
+        # 搜集所有可能的init程序
+        all_init_candidates = []
+        
+        # 从内核中提取init信息
+        if kernel_path:
+            kernel_init_paths = self.extract_init_from_kernel(kernel_path)
+            for init_path in kernel_init_paths:
+                # 转换为文件系统路径
+                full_path = os.path.join(fs_path, init_path.lstrip('/'))
+                print(f"    - Kernel init path: {init_path} -> Full path: {full_path}")
+                # 检查路径是否存在且不是目录
+                if os.path.exists(full_path) and not os.path.isdir(full_path):
+                    all_init_candidates.append(full_path)
+                else:
+                    print(f"    - Kernel init path does not exist: {full_path}")
+        
+        # 先按POTENTIAL_INIT中的路径搜索具体文件
+        for init_path in POTENTIAL_INIT:
+            full_path = os.path.join(fs_path, init_path.lstrip('/'))
+            if os.path.exists(full_path) and not os.path.isdir(full_path):
+                all_init_candidates.append(full_path)
+                
+        # 若没搜索到则在fs_path搜索POTENTIAL_INIT_BASENAME的文件名
+        if not all_init_candidates:  # 如果前面没有搜索到任何 init 候选
+            for root, dirs, files in os.walk(fs_path, topdown=False):
+                for name in files:
+                    if name.lower() in [item.lower() for item in POTENTIAL_INIT_BASENAME]:
+                        full_path = os.path.join(root, name)
+                        all_init_candidates.append(full_path)
+        
+        # 去重但保持原始顺序
+        seen = set()
+        unique_init_candidates = []
+        for candidate in all_init_candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                unique_init_candidates.append(candidate)
+        
+        # 打印所有可能的init程序
+        if unique_init_candidates:
+            print("    - Found all potential init candidates:")
+            for candidate in unique_init_candidates:
+                print(f"        * {candidate}")
+            # # 尝试使用LLM评估
+            # llm_best = llm_evaluate_init_candidates(unique_init_candidates, fs_path)
+            # if llm_best:
+            #     self.llm_init = llm_best
+            #     print(f"    - Found best init (LLM): {llm_best}")
+            #     return llm_best
+            # 选择第一个
+            print(f"    - Selecting first candidate: {unique_init_candidates[0]}")
+            return unique_init_candidates[0]
+        else:
+            print("    - No init candidates found")
+            return ""
+    
+    def get_target_binary_and_init(self, fs_path, rehost_type, kernel_path=None):
         potential_binaries = self.get_potential_binaries(rehost_type)
         pot_targets = dict()
         bin_path_final = ""
-        init_path_final = ""
-        
-        # 1. 收集所有潜在的init脚本路径，按照FirmAE的优先级顺序
-        init_candidates = []
-        
-        # 检查kernelInit文件（如果存在）
-        kernel_init_path = os.path.join(fs_path, "kernelInit")
-        if os.path.exists(kernel_init_path):
-            try:
-                with open(kernel_init_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        if '=' in line:
-                            full_path = line.split('=')[1].strip()
-                            if full_path:
-                                init_candidates.append(os.path.join(fs_path, full_path.lstrip('/')))
-            except:
-                pass
-        
-        # 检查/init
-        init_path = os.path.join(fs_path, "init")
-        if os.path.exists(init_path) and not os.path.isdir(init_path):
-            init_candidates.append(init_path)
-        
-        # 检查/sbin/init
-        sbin_init_path = os.path.join(fs_path, "sbin", "init")
-        if os.path.exists(sbin_init_path) and not os.path.isdir(sbin_init_path):
-            init_candidates.append(sbin_init_path)
-        
-        # # 查找所有名为preinitMT、preinit、rcS的文件
-        # for root, dirs, files in os.walk(fs_path):
-        #     for name in files:
-        #         if name in ["preinitMT", "preinit", "rcS", "rc", "profile"]:
-        #             full_path = os.path.join(root, name)
-        #             init_candidates.append(full_path)
-        
-        
         
         # 收集潜在的二进制文件
         for root, dirs, files in os.walk(fs_path, topdown=False):
             for name in files:
-                if name in ["preinitMT", "preinit", "rcS", "rcs", "rc", "profile"]:
-                    full_path = os.path.join(root, name)
-                    init_candidates.append(full_path)
                 if name.lower() in potential_binaries:
                     if name.lower() not in pot_targets.keys():
                         pot_targets[name.lower()] = []
@@ -884,22 +1335,8 @@ class Planter():
                     continue
                 break
             
-            # 去重并保持原始顺序
-        seen = set()
-        unique_init_candidates = []
-        for candidate in init_candidates:
-            if candidate not in seen:
-                seen.add(candidate)
-                unique_init_candidates.append(candidate)
-        
-        print("Potential Init Candidates: " + str(unique_init_candidates))
-        
-        # 验证候选文件并选择第一个有效的init脚本
-        for candidate in unique_init_candidates:
-            if os.path.exists(candidate) and not os.path.isdir(candidate):
-                init_path_final = candidate
-                print("    - Found init: %s" % init_path_final)
-                break
+        # 调用get_init函数获取init程序
+        init_path_final = self.get_init(fs_path, kernel_path)
 
         return [bin_path_final, init_path_final]
     
@@ -950,7 +1387,7 @@ class Planter():
         return ""
 
     def setup_env(self, qemu_src_path, fs_path, bin_path, baseline_mode):
-        self.fixer = Fixer(qemu_src_path, self.gh_path, self.scripts_path, self.brand, baseline_mode)
+        self.fixer = Fixer(qemu_src_path, self.gh_path, self.scripts_path, self.brand, baseline_mode, self.no_services)
         r = self.fixer.initial_setup(fs_path, bin_path)
         return r 
 
@@ -1104,7 +1541,73 @@ class Planter():
         return self.fixer.get_ips_from_nvram()
 
     def find_sourcefile(self, target, fs_path, path):
-        sourcefile = self.fixer.find_file(os.path.basename(target), fs_path, include_backups=True, skip=[path])
+        target_name = os.path.basename(target)
+        
+        # 优先使用缓存
+        if self.file_cache is not None:
+            print("    - [Cache] Searching for %s in file cache" % target_name)
+            if target_name in self.file_cache:
+                print("    - [Cache] Found %s in file cache" % target_name)
+                for file_path in self.file_cache[target_name]:
+                    if file_path != path and os.path.exists(file_path):
+                        print("    - [Cache] Using cached file: %s" % file_path)
+                        return file_path
+            
+            # 处理备份文件
+            for tag in BACKUP_TAGS:
+                backup_name = target_name + "." + tag
+                if backup_name in self.file_cache:
+                    print("    - [Cache] Found backup %s in file cache" % backup_name)
+                    for file_path in self.file_cache[backup_name]:
+                        if file_path != path and os.path.exists(file_path):
+                            print("    - [Cache] Using cached backup file: %s" % file_path)
+                            return file_path
+            
+            # 处理htm和html等效的情况
+            if (target.endswith(".html") or target.endswith(".htm")):
+                targetbasename = target_name.rsplit(".")[0]
+                for ext in [".htm", ".html"]:
+                    alt_name = targetbasename + ext
+                    if alt_name in self.file_cache:
+                        print("    - [Cache] Found alternative %s in file cache" % alt_name)
+                        for file_path in self.file_cache[alt_name]:
+                            if file_path != path and os.path.exists(file_path):
+                                print("    - [Cache] Using cached alternative file: %s" % file_path)
+                                return file_path
+                    # 处理备份文件
+                    for tag in BACKUP_TAGS:
+                        backup_name = alt_name + "." + tag
+                        if backup_name in self.file_cache:
+                            print("    - [Cache] Found backup %s in file cache" % backup_name)
+                            for file_path in self.file_cache[backup_name]:
+                                if file_path != path and os.path.exists(file_path):
+                                    print("    - [Cache] Using cached backup file: %s" % file_path)
+                                    return file_path
+            
+            # 处理conf, config和cnf等效的情况
+            if (target.endswith(".conf") or target.endswith(".cnf") or target.endswith(".config")):
+                targetbasename = target_name.rsplit(".")[0]
+                for ext in [".config", ".conf", ".cnf"]:
+                    alt_name = targetbasename + ext
+                    if alt_name in self.file_cache:
+                        print("    - [Cache] Found alternative %s in file cache" % alt_name)
+                        for file_path in self.file_cache[alt_name]:
+                            if file_path != path and os.path.exists(file_path):
+                                print("    - [Cache] Using cached alternative file: %s" % file_path)
+                                return file_path
+                    # 处理备份文件
+                    for tag in BACKUP_TAGS:
+                        backup_name = alt_name + "." + tag
+                        if backup_name in self.file_cache:
+                            print("    - [Cache] Found backup %s in file cache" % backup_name)
+                            for file_path in self.file_cache[backup_name]:
+                                if file_path != path and os.path.exists(file_path):
+                                    print("    - [Cache] Using cached backup file: %s" % file_path)
+                                    return file_path
+        
+        # 缓存未命中时，使用原始方法
+        print("    - [Cache] Cache miss for %s, using original method" % target_name)
+        sourcefile = self.fixer.find_file(target_name, fs_path, include_backups=True, skip=[path])
 
         # handle edge case where htm and html are equivalent
         if len(sourcefile) <= 0 and (target.endswith(".html") or target.endswith(".htm")):
@@ -1136,6 +1639,10 @@ class Planter():
         if already_success:
             print("    - already successful, focusing on get working nvrams up")
             return
+
+        # 构建文件系统缓存，避免重复遍历
+        if self.file_cache is None:
+            self.build_file_cache(fs_path)
 
         for folder in folders:
             if folder in failed:
@@ -1216,9 +1723,12 @@ class Planter():
 
             # check if file might exists somewhere else we can copy
             sourcefile = self.find_sourcefile(target, fs_path, path)
+            # target_name = os.path.basename(path)
+            # sourcefile = self.find_sourcefile(target_name, fs_path, path)
             if len(sourcefile) <= 0:
                 # try looking in templates
                 sourcefile = self.find_sourcefile(target, self.gh_templates_path, path)
+                # sourcefile = self.find_sourcefile(target_name, self.gh_templates_path, path)
 
             # transplant file
             if len(sourcefile) > 0:
@@ -1256,11 +1766,16 @@ class Planter():
                 f = f.strip("/")
             target_path = os.path.join(fs_path, f)
             target_path = str(pathlib.Path(target_path).resolve()) # handle symlinks
+            # try:
+            #     target_path = str(pathlib.Path(target_path).resolve()) # handle symlinks
+            # except FileNotFoundError:
+            #     # 符号链接存在但目标不存在，保持原始路径
+            #     pass
             if fs_path not in target_path:
                 while target_path.startswith("/") or target_path.endswith("/"):
                     target_path = target_path.strip("/")
                 target_path = os.path.join(fs_path, target_path)
-            libpath = self.fixer.find_library(os.path.basename(f), fs_path, skip=[target_path])
+            libpath = self.fixer.find_library(os.path.basename(f), fs_path, skip=[target_path], file_cache=self.file_cache)
             print("    - [Greenhouse] Processing failed lib %s" % f)
             if len(libpath) > 0 and os.path.exists(libpath):
                 print("    - Found misplaced library %s, moving to %s" % (libpath, target_path))
@@ -1494,184 +2009,25 @@ class Planter():
                             for line in lines:
                                 confFile.write(line)
                         confFile.close()
-    
-    def extract_kernel_init(self, img_path, extracted_path):
-        """
-        Extract kernelInit file from firmware using FirmAE-style extraction logic
-        """
-        # FirmAE-style kernel extraction and init path detection
-        potential_kernel_files = []
         
-        # 2. Use FirmAE's extraction logic (similar to extractor.py)
-        try:
-            import binwalk
-            import tempfile
-            import shutil
-            
-            print("    - Using FirmAE-style extraction logic")
-            
-            # Create temporary directory for extraction
-            temp_dir = tempfile.mkdtemp()
-            print(f"    - Created temporary directory: {temp_dir}")
-            
-            # Scan and extract firmware with binwalk (like FirmAE does)
-            print("    - Scanning firmware with binwalk...")
-            for module in binwalk.scan(img_path, "--run-as=root", "--preserve-symlinks",
-                    "-e", "-r", "-C", temp_dir, signature=True, quiet=True):
-                for entry in module.results:
-                    desc = entry.description
-                    dir_name = module.extractor.directory
-                    
-                    # Check for firmware headers (like FirmAE's _check_firmware)
-                    if 'header' in desc:
-                        # uImage header
-                        if "uImage header" in desc:
-                            if "OS Kernel Image" in desc:
-                                # Extract kernel from uImage
-                                kernel_offset = entry.offset + 64
-                                kernel_size = 0
-                                
-                                for stmt in desc.split(','):
-                                    if "image size:" in stmt:
-                                        kernel_size = int(''.join(
-                                            i for i in stmt if i.isdigit()), 10)
-                                
-                                if kernel_size > 0:
-                                    print(f"    - Found uImage kernel: offset={kernel_offset}, size={kernel_size}")
-                                    # Extract kernel using dd
-                                    kernel_path = os.path.join(temp_dir, "extracted_kernel")
-                                    with open(img_path, "rb") as ifp:
-                                        with open(kernel_path, "wb") as ofp:
-                                            ifp.seek(kernel_offset, 0)
-                                            ofp.write(ifp.read(kernel_size))
-                                    potential_kernel_files.append(kernel_path)
-                            
-                            # TP-Link or TRX header
-                            elif "rootfs offset: " in desc and "kernel offset: " in desc:
-                                image_size = os.path.getsize(img_path)
-                                kernel_offset = 0
-                                kernel_size = 0
-                                
-                                for stmt in desc.split(','):
-                                    if "kernel offset:" in stmt:
-                                        kernel_offset = int(stmt.split(':')[1], 16)
-                                    elif "kernel length:" in stmt:
-                                        kernel_size = int(stmt.split(':')[1], 16)
-                                
-                                kernel_offset += entry.offset
-                                
-                                if kernel_size == 0:
-                                    # Calculate kernel size if not provided
-                                    rootfs_offset = 0
-                                    for stmt in desc.split(','):
-                                        if "rootfs offset:" in stmt:
-                                            rootfs_offset = int(stmt.split(':')[1], 16)
-                                    rootfs_offset += entry.offset
-                                    kernel_size = rootfs_offset - kernel_offset
-                                
-                                if kernel_size > 0:
-                                    print(f"    - Found TP-Link/TRX kernel: offset={kernel_offset}, size={kernel_size}")
-                                    # Extract kernel using dd
-                                    kernel_path = os.path.join(temp_dir, "extracted_kernel")
-                                    with open(img_path, "rb") as ifp:
-                                        with open(kernel_path, "wb") as ofp:
-                                            ifp.seek(kernel_offset, 0)
-                                            ofp.write(ifp.read(kernel_size))
-                                    potential_kernel_files.append(kernel_path)
-                    
-                    # Check for kernel files (like FirmAE's _check_kernel)
-                    elif 'kernel' in desc:
-                        if "kernel version" in desc and "Linux" in desc:
-                            print(f"    - Found kernel file: {entry.filename}")
-                            kernel_path = os.path.join(dir_name, entry.filename)
-                            if os.path.exists(kernel_path):
-                                potential_kernel_files.append(kernel_path)
-                    
-                    # Check for compressed files and archives (like FirmAE's _check_recursive)
-                    elif 'filesystem' in desc or 'archive' in desc or 'compressed' in desc:
-                        if dir_name:
-                            # Recursively search for kernel files in extracted directory
-                            for root, dirs, files in os.walk(dir_name):
-                                for file in files:
-                                    file_path = os.path.join(root, file)
-                                    try:
-                                        # Check file type
-                                        file_type = subprocess.check_output(["file", "-b", file_path], stderr=subprocess.STDOUT, text=True).strip().lower()
-                                        if any(keyword in file_type for keyword in ["kernel", "linux", "boot"]):
-                                            potential_kernel_files.append(file_path)
-                                    except Exception:
-                                        pass
-        except Exception as e:
-            print(f"    - FirmAE extraction failed, using fallback: {e}")
-        
-        # 3. Fallback: search for kernel files in extracted directory
-        if not potential_kernel_files:
-            print("    - Searching for kernel files in extracted directory...")
-            for root, dirs, files in os.walk(extracted_path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if os.path.isfile(file_path):
+        # 需要检查的符号链接基本名称列表
+        important_dirs = {"etc", "usr", "var", "dev", "home", "mnt", "www", "etc_ro", "tmp", "run", "sys", "proc", "media", "root"}
+        # 只检查第一层文件夹
+        for item in os.listdir(target_fs):
+            item_path = os.path.join(target_fs, item)
+            if os.path.islink(item_path):
+                basename = os.path.basename(item_path)
+                if basename in important_dirs:
+                    link_target = os.readlink(item_path)
+                    link_target = os.path.join(target_fs, link_target.lstrip('/'))
+                    print(f"Symlink {item_path} points to {link_target}")
+                    # 若符号连接的目标路径不存在，则创建
+                    if not os.path.exists(link_target):
+                        print(f"Creating symlink target: {link_target}")
                         try:
-                            # Check file type
-                            file_type = subprocess.check_output(["file", "-b", file_path], stderr=subprocess.STDOUT, text=True).strip().lower()
-                            
-                            # Look for kernel-related files
-                            if any(keyword in file_type for keyword in ["kernel", "linux", "boot", "vmlinuz"]):
-                                potential_kernel_files.append(file_path)
-                            else:
-                                # Check file content
-                                strings_output = subprocess.check_output(["strings", file_path], stderr=subprocess.STDOUT, text=True).lower()
-                                if any(keyword in strings_output for keyword in ["linux version", "init=/", "kernel command line"]):
-                                    potential_kernel_files.append(file_path)
-                        except Exception:
-                            pass
-        
-        # 4. Process each potential kernel file (like FirmAE's inferKernel.py)
-        for kernel_path in potential_kernel_files:
-            print(f"    - Processing kernel file: {kernel_path}")
-            
-            # Create a scratch directory for processing (like FirmAE does)
-            scratch_dir = os.path.join(os.path.dirname(kernel_path), "scratch")
-            os.makedirs(scratch_dir, exist_ok=True)
-            
-            try:
-                # Step 1: Extract kernel version (like inferKernel.py line 28-29)
-                kernel_version_path = os.path.join(scratch_dir, "kernelVersion")
-                os.system(f"strings {kernel_path} | grep \"Linux version\" > {kernel_version_path}")
-                
-                # Step 2: Extract kernel command lines with init=/ (like inferKernel.py line 31-32)
-                kernel_cmd_path = os.path.join(scratch_dir, "kernelCmd")
-                os.system(f"strings {kernel_path} | grep \"init=/\" | sed -e 's/^\"//' -e 's/\"$//' > {kernel_cmd_path}")
-                
-                # Step 3: Parse kernelCmd to create kernelInit (like inferKernel.py ParseCmd function)
-                kernel_init_path = os.path.join(scratch_dir, "kernelInit")
-                init_paths = []
-                
-                if os.path.exists(kernel_cmd_path):
-                    with open(kernel_cmd_path, 'r') as f:
-                        cmds = f.read()
-                        for cmd in cmds.split('\n')[:-1]:
-                            if "init=/" in cmd:
-                                init_paths.append(cmd)
-                
-                # Write to kernelInit file if we found init paths
-                if init_paths:
-                    with open(kernel_init_path, "w") as f:
-                        for path in init_paths:
-                            f.write(path + "\n")
-                    print(f"    - Generated kernelInit file: {kernel_init_path}")
-                    
-                    # Also copy kernelInit to extracted path for easy access
-                    extracted_kernel_init = os.path.join(extracted_path, "kernelInit")
-                    shutil.copy(kernel_init_path, extracted_kernel_init)
-                    print(f"    - Copied kernelInit to: {extracted_kernel_init}")
-            except Exception as e:
-                print(f"    - Error extracting kernelInit: {e}")
-        
-        # 5. Clean up temporary directory
-        try:
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-                print(f"    - Cleaned up temporary directory: {temp_dir}")
-        except Exception:
-            pass
+                            os.makedirs(link_target, exist_ok=True)
+                            print(f"Successfully created: {link_target}")
+                        except Exception as e:
+                            print(f"Error creating {link_target}: {e}")
+                    else:
+                        print(f"Symlink target already exists: {link_target}")

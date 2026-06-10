@@ -22,6 +22,16 @@ if (${FIRMAE_BOOT}); then
       arr+=(/sbin/init)
     fi
   fi
+  if [ -e /sbin/init ]; then
+    if [ ! -d /sbin/init ]; then
+      arr+=(/etc/init)
+    fi
+  fi
+  if [ -e /sbin/init ]; then
+    if [ ! -d /sbin/init ]; then
+      arr+=(/etc/system/sysinit)
+    fi
+  fi
   for FILE in `${BUSYBOX} find / -name "preinitMT" -o -name "preinit" -o -name "rcS"`
   do
     arr+=(${FILE})

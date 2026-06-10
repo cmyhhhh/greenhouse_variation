@@ -11,7 +11,7 @@ import time
 import os
 import selenium
 from selenium import webdriver
-# from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import UnexpectedAlertPresentException
@@ -36,16 +36,16 @@ class WebCheck:
         self.current_url = ""
 
     def Connect(self, url, auth):
-        print("WebCheck Connect")
+        print("[FirmAE] WebCheck Connect")
         options = webdriver.ChromeOptions()
         options.add_argument('--headless')
         options.add_argument('--no-sandbox')
         options.add_argument('--screen-size=1200x600')
-        options.set_capability('unhandledPromptBehaviour', 'dismiss')
-        options.set_capability('unexpectedAlertBehaviour', 'dismiss')
-        # service = Service(executable_path='/gh/chromedriver') # 修改这里的路径
-        # self.driver = webdriver.Chrome(service=service, options=options)
-        self.driver = webdriver.Chrome(options=options)
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-dev-shm-usage')
+        chromedriver_path = "/gh/chromedriver"
+        service = Service(executable_path=chromedriver_path)
+        self.driver = webdriver.Chrome(service=service, options=options)
         self.driver.set_page_load_timeout(60)
         try:
             if ":" in auth:
@@ -53,10 +53,10 @@ class WebCheck:
                 splitIndex = index+3
                 head = url[:splitIndex]
                 tail = url[splitIndex:]
-                print(f"    - GET {head + auth + '@' + tail}")
+                print(f"[FirmAE]     - GET {head + auth + '@' + tail}")
                 self.driver.get(head + auth + '@' + tail)
             else:
-                print(f"    - GET {url}")
+                print(f"[FirmAE]     - GET {url}")
                 self.driver.get(url)
             time.sleep(5)
             self.connected = True
@@ -66,9 +66,9 @@ class WebCheck:
 
     def HandleAlert(self):
         try:
-            alert = self.driver.switch_to_alert()
+            alert = self.driver.switch_to.alert
             if alert:
-                print("    - catching and accepting alert")
+                print("[FirmAE]     - catching and accepting alert")
                 alert.accept()
             return alert
         except:
@@ -84,17 +84,17 @@ class WebCheck:
                     self.current_url = self.driver.current_url
                     retry = False
 
-                    print("Check")
-                    print("="*50)
-                    print("HTML source")
-                    print("="*50)
+                    print("[FirmAE] Check")
+                    print("[FirmAE] ="*50)
+                    print("[FirmAE] HTML source")
+                    print("[FirmAE] ="*50)
                     if len(page_source) > 200:
                         print(page_source[:200])
-                        print("="*50)
-                        print("<truncated>")
+                        print("[FirmAE] ="*50)
+                        print("[FirmAE] <truncated>")
                     else:
                         print(page_source)
-                    print("="*50)
+                    print("[FirmAE] ="*50)
                     if "<html" in page_source or "<script" in page_source:
                         for entry in self.driver.get_log('browser'):
                             if entry["level"] == "SEVERE":
@@ -110,7 +110,7 @@ class WebCheck:
                                     if isWhitelisted:
                                         continue
                                     print(entry)
-                                    print("="*50)
+                                    print("[FirmAE] ="*50)
                                     return False, 500
                         raw_data = lxml.html.fromstring(page_source).text_content()
                         if len(raw_data) <= 0: # check for empty content
@@ -130,7 +130,7 @@ class WebCheck:
                     self.HandleAlert()
                     retry = True
                 except Exception as e: # malformed html
-                    print("    - malformed html")
+                    print("[FirmAE]     - malformed html")
                     print(e)
                     return False, 206
         return False, -1
@@ -151,7 +151,7 @@ class WebCheck:
             except Exception as e:
                 print(e)
             time.sleep(3)
-            print("    - handled alert, reattempting close...")
+            print("[FirmAE]     - handled alert, reattempting close...")
 
         time.sleep(3) # wait a little before quitting
         self.driver.quit()
@@ -230,7 +230,7 @@ class Login:
 
         if login_type == 'basic':
             reply = session.get(url=ip, timeout=5, verify=False, auth=(username, password))
-            print(f"    - attempt: {login_type} {ip} {username} {password} {reply}")
+            print(f"[FirmAE]     - attempt: {login_type} {ip} {username} {password} {reply}")
             return reply.status_code != 401, dict(reply.request.headers), reply.request.body, ip
 
         elif login_type == 'digest':
@@ -383,12 +383,12 @@ class URLCheck:
 
             if is_ssl and not self.url.startswith("https"):
                 self.url = self.url.replace("http://", "https://")
-            print(f"    - sending curl request check @ {self.url}")
+            print(f"[FirmAE]     - sending curl request check @ {self.url}")
             try:
                 r = self.session.get(url=self.url, timeout=5, verify=False, headers=self.headers, allow_redirects=True)
                 retry = False
             except Exception as e:
-                print("Connection failed")
+                print("[FirmAE] Connection failed")
                 print(e)
                 retry = False
                 if "timed out" in str(e):
@@ -409,11 +409,11 @@ class URLCheck:
 
         if r is not None and not self.timedout:
             self.last_status_code = r.status_code
-            print(f"    - [curlcheck]: Request returned", r.status_code)
+            print(f"[FirmAE]     - [curlcheck]: Request returned", r.status_code)
             http_text = r.text.encode("utf-8", errors='ignore')
             if len(http_text) > 200:
                 print(http_text[:200])
-                print("<truncated>")
+                print("[FirmAE] <truncated>")
             else:
                 print(http_text)
 
@@ -429,7 +429,7 @@ class URLCheck:
 
         self.login_type = login_type # only save the login type in the initial success case
 
-        print(f"    - Login Type: {self.login_type}")
+        print(f"[FirmAE]     - Login Type: {self.login_type}")
         logged_in = False
         headers = {}
         reply = None
@@ -439,12 +439,12 @@ class URLCheck:
                     user = self.user
                     password = self.password
                 try:
-                    print(f"      - Trying user: {user} password: {password}")
+                    print(f"[FirmAE]       - Trying user: {user} password: {password}")
                     
                     logged_in, headers, payload, loginurl = Login.login(session, self.brand, self.url, self.login_type, user, password)
-                    print(f"      - logged in {logged_in}")
+                    print(f"[FirmAE]       - logged in {logged_in}")
                 except Exception as e:
-                    print("      - ERROR login attempt failed")
+                    print("[FirmAE]       - ERROR login attempt failed")
                     print(e)
                 time.sleep(2) # delay to subvert brute force protection
                 if logged_in:
@@ -452,11 +452,11 @@ class URLCheck:
                     try:
                         logged_in, _, _, _ = Login.login(session, self.brand, self.url, self.login_type, user, password)
                     except Exception as e:
-                        print("      - ERROR login attempt failed")
+                        print("[FirmAE]       - ERROR login attempt failed")
                         print(e)
                         logged_in = False
                     if not logged_in:
-                        print("      x- false login success, retry")
+                        print("[FirmAE]       x- false login success, retry")
                         continue
                     self.user = user
                     self.password = password
@@ -479,15 +479,15 @@ class URLCheck:
         wbc.Initialize(self.analysis_path)
         if self.login_needed:
             auth = f"{self.user}:{self.password}"
-            print(f"    - using auth {auth}")
+            print(f"[FirmAE]     - using auth {auth}")
         else:
             auth = ""
         wbc.Connect(self.url, auth)
         wellformed, self.last_status_code = wbc.Check()
         if wellformed and self.last_status_code == 200: # do two attempts, since its possible we crashed after the first
-            print("="*50)
-            print("    - second check")
-            print("="*50)
+            print("[FirmAE] ="*50)
+            print("[FirmAE]     - second check")
+            print("[FirmAE] ="*50)
             wellformed, self.last_status_code = wbc.Check()
         wbc.Close()
         if self.last_status_code == 401:
@@ -509,8 +509,8 @@ class URLCheck:
         self.session = requests.Session()
 
         while True:
-            print("[+] curltest")
-            print(f"[+] Probing {self.url}...")
+            print("[FirmAE] [+] curltest")
+            print(f"[FirmAE] [+] Probing {self.url}...")
             reply = self.curlcheck()
 
             # check if response is 200 or 401:
@@ -519,20 +519,20 @@ class URLCheck:
             #   - if login script does not find anything and response is 200, proceed
             #   - otherwise, fail
             if reply is None:
-                print("    - CurlCheck failed!")
+                print("[FirmAE]     - CurlCheck failed!")
                 break
 
             if reply.status_code != 200 and reply.status_code != 401:
-                print("    - CurlCheck failed!")
+                print("[FirmAE]     - CurlCheck failed!")
                 break
 
             # curlcheck passed for this test cycle
             if not self.curl_success:
                 self.curl_success = True
                 self.reply = reply
-                print("[+] Page found, retesting...")
+                print("[FirmAE] [+] Page found, retesting...")
                 continue
-            print("[+] curlpassed")
+            print("[FirmAE] [+] curlpassed")
 
             # save working curl
             curlheaders = ""
@@ -554,14 +554,14 @@ class URLCheck:
                 self.loginurl = self.url
             curlcommand += f" {self.loginurl}"
             self.working_curl = curlcommand
-            print(f"    [+] Working cURL: {curlcommand}")
+            print(f"[FirmAE]     [+] Working cURL: {curlcommand}")
 
-            print("[+] logintest")
+            print("[FirmAE] [+] logintest")
             logged_in, login_needed = self.logincheck(self.session)
 
             # either don't need login or do need and successfully logged in
             if login_needed and not logged_in:
-                print("    - Login failed!")
+                print("[FirmAE]     - Login failed!")
                 break
 
             # logincheck passed for this test cycle
@@ -569,36 +569,36 @@ class URLCheck:
                 self.login_success = True
                 self.login_needed = login_needed
                 if self.login_needed:
-                    print(f"[+] Logged in with {self.user}:{self.password} via <{self.login_type}> @ '{self.loginurl}', retesting")
+                    print(f"[FirmAE] [+] Logged in with {self.user}:{self.password} via <{self.login_type}> @ '{self.loginurl}', retesting")
                     # Retest with authenticated session
                     reply = self.curlcheck()
                     if reply:
                         self.reply = reply
                     continue
                 else:
-                    print("    - no login needed, continuing...")
+                    print("[FirmAE]     - no login needed, continuing...")
 
-            print("[+] loginpassed")
+            print("[FirmAE] [+] loginpassed")
 
             # get webpage content
-            print("[+] webcheck")
+            print("[FirmAE] [+] webcheck")
             self.wellformed, retryurl = self.webcheck()
             if len(retryurl) > 0 and self.url != retryurl:
-                print(f"    - retrying with new url {retryurl}")
+                print(f"[FirmAE]     - retrying with new url {retryurl}")
                 self.url = retryurl
                 self.curl_success = False
                 self.login_success = False
                 continue
 
             if not self.wellformed:
-                print("    - WebCheck failed!")
+                print("[FirmAE]     - WebCheck failed!")
                 if self.last_status_code == 200:
                     self.last_status_code = 204
                 break
 
-            print("[+] webpassed")
+            print("[FirmAE] [+] webpassed")
 
-            print(f"[+] All checks passed for {self.url}! Webpage is wellformed and running!")
+            print(f"[FirmAE] [+] All checks passed for {self.url}! Webpage is wellformed and running!")
 
             break
 
@@ -638,9 +638,9 @@ class HTTPInteractionCheck:
                 self.urlchecks.sort(key=self.get_url)
                 self.urlchecks.sort(key=self.get_port)
                 for uc in self.urlchecks:
-                    print(f"    >>> checking {uc.url} {uc.last_status_code}")
+                    print(f"[FirmAE]     >>> checking {uc.url} {uc.last_status_code}")
                     if uc.last_status_code == 200:
-                        print(f"Status Code: {uc.last_status_code}")
+                        print(f"[FirmAE] Status Code: {uc.last_status_code}")
                         if strict:
                             if uc.wellformed:
                                 return True, True, uc.curl_success
@@ -650,7 +650,7 @@ class HTTPInteractionCheck:
                         connected = uc.curl_success
                     
                     if uc.last_status_code != -1:
-                        print(f"Status Code: {uc.last_status_code}")
+                        print(f"[FirmAE] Status Code: {uc.last_status_code}")
         
         return False, False, connected
     
@@ -665,7 +665,7 @@ class HTTPInteractionCheck:
             self.urlchecks.sort(key=self.get_port)
             
             for uc in self.urlchecks:
-                print(f"    >>> checking {uc.url} {uc.last_status_code}")
+                print(f"[FirmAE]     >>> checking {uc.url} {uc.last_status_code}")
                 if not strict or uc.wellformed:
                     wellformed_ucs.append(uc)
                     if uc.login_type == "unknown" or uc.login_type == "":
@@ -682,7 +682,7 @@ class HTTPInteractionCheck:
 
 def main():
     if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} [BRAND] [ANALYSIS_PATH] [URL;URL;URL]")
+        print(f"[FirmAE] Usage: {sys.argv[0]} [BRAND] [ANALYSIS_PATH] [URL;URL;URL]")
         sys.exit(1)
     
     brand = sys.argv[1]
@@ -690,17 +690,17 @@ def main():
     ips = sys.argv[3].split(";")
     ports = ["80", "443"]
     
-    print(f"Running greenhouse_checker: {brand} {analysis_path} {ips} {ports}")
+    print(f"[FirmAE] Running greenhouse_checker: {brand} {analysis_path} {ips} {ports}")
     
     checker = HTTPInteractionCheck(brand, analysis_path)
     probe_success = checker.probe(ips, ports)
     
     if probe_success:
         success, wellformed, connected = checker.check(exit_code=None, timedout=False, errored=False, strict=True)
-        print(f"\nResults:")
-        print(f"Success: {success}")
-        print(f"Wellformed: {wellformed}")
-        print(f"Connected: {connected}")
+        print(f"[FirmAE] \nResults:")
+        print(f"[FirmAE] Success: {success}")
+        print(f"[FirmAE] Wellformed: {wellformed}")
+        print(f"[FirmAE] Connected: {connected}")
         
         # Determine best IP
         best_ip = ""
@@ -711,11 +711,13 @@ def main():
         if not best_ip and checker.urlchecks:
             best_ip = checker.urlchecks[0].ip
         
-        print(f"Best IP: {best_ip}")
-        print(f"\nOutput format: <IP> <PING_RESULT> <WEB_RESULT> <TIME_PING> <TIME_WEB>")
+        print(f"[FirmAE] Best IP: {best_ip}")
+        print(f"[FirmAE] \nOutput format: <IP> <PING_RESULT> <WEB_RESULT> <TIME_PING> <TIME_WEB>")
+        print(f"[FirmAE] Greenhouse-style HTTP checker result: {best_ip} {str(connected).lower()} {str(success).lower()} 0 0")
         print(f"{best_ip} {str(connected).lower()} {str(success).lower()} 0 0")
     else:
-        print("No web service detected")
+        print("[FirmAE] No web service detected")
+        print("[FirmAE] Greenhouse-style HTTP checker result: None false false 0 0")
         print("None false false 0 0")
 
 if __name__ == "__main__":
